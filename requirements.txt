@@ -1,0 +1,5 @@
+# r-bot зависимости.
+# Фиксируем нижние версии, верхние не закрепляем чтобы security-апдейты прилетали.
+python-telegram-bot[job-queue]>=21.0
+paramiko>=3.4
+PyYAML>=6.0
