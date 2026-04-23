@@ -1,0 +1,57 @@
+[Unit]
+Description=r-bot — Telegram bot for managing OpenWrt routers via FRP
+Documentation=https://github.com/yarik88/r-bot
+After=network-online.target
+Wants=network-online.target
+# Если FRPS сервис называется иначе — поправь.
+After=frps.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+# Код лежит тут (git clone), venv рядом.
+WorkingDirectory=/opt/r-bot-src
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+# Путь к venv-python задаётся install.sh. Если поменяешь — правь тут.
+ExecStart=/opt/r-bot-venv/bin/python -u /opt/r-bot-src/bot/r_bot.py --config /etc/r/bot.yaml
+
+# Мягкая остановка: бот ловит SIGTERM и закрывает polling.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+# Рестарт только при падениях, не при штатном exit 0.
+Restart=on-failure
+RestartSec=10s
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Журналирование.
+StandardOutput=append:/var/log/r-bot.log
+StandardError=append:/var/log/r-bot.log
+SyslogIdentifier=r-bot
+
+# Защита процесса. Часть прав нужна (SSH к роутерам, чтение /etc/r, запись в /var/lib/r-bot).
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ReadWritePaths=/var/lib/r-bot /var/log/r-bot.log /var/backups/r-bot /etc/r
+# Для auto-update бот пишет в WorkingDirectory — но безопаснее иметь
+# отдельный update.sh, который дёргается руками/кроном; см. scripts/update.sh.
+
+# Ресурсные лимиты — бот легковесный.
+MemoryMax=256M
+CPUQuota=50%
+
+[Install]
+WantedBy=multi-user.target

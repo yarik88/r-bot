@@ -1,0 +1,65 @@
+# /etc/r/bot.yaml — конфиг Telegram-бота r-bot
+# НИКОГДА не пуши этот файл в git! См. .gitignore
+# Права: chmod 600, владелец root
+
+# ============================================================
+# ОБЯЗАТЕЛЬНЫЕ ПАРАМЕТРЫ
+# ============================================================
+
+# Токен бота от @BotFather
+token: "PASTE_YOUR_BOT_TOKEN_HERE"
+
+# Твой Telegram user ID (узнать у @userinfobot)
+# Эти пользователи автоматически получают роль admin
+admins:
+  - 123456789
+  # - 987654321   # можно несколько
+
+# ============================================================
+# ОПЦИОНАЛЬНЫЕ (есть разумные defaults)
+# ============================================================
+
+digest:
+  enabled: true             # отправлять ежедневный отчёт админу
+  time: "09:00"             # по timezone ниже
+  timezone: "Europe/Moscow"
+
+poll:
+  interval_minutes: 15      # как часто опрашивать роутеры
+  ssh_timeout_sec: 10
+  parallel_workers: 10      # параллельных SSH
+
+backup:
+  daily_cron: "03:00"       # ежедневный локальный дамп (14 дней хранится)
+  weekly_telegram: true     # слать .tar.gz админу по воскресеньям
+  weekly_time: "10:00"
+  weekly_day: "Sun"         # Mon/Tue/Wed/Thu/Fri/Sat/Sun
+  keep_days: 14
+
+auto_update:
+  enabled: false            # по умолчанию выкл
+  time: "04:00"
+  branch: "main"
+  repo_dir: "/opt/r-bot-src"
+
+paths:
+  r_config: "/etc/r/config.yaml"
+  db: "/var/lib/r-bot/bot.db"
+  log: "/var/log/r-bot.log"
+  runs: "/var/lib/r-bot/runs"
+  backups: "/var/backups/r-bot"
+
+# Rate limits для клиентов (admin без лимитов)
+rate_limits:
+  reboot_per_day: 5
+  podkop_restart_per_day: 10
+  vless_change_per_day: 20
+  global_check_per_day: 50
+
+# Начальные клиенты (опционально) — для быстрого старта
+# без генерации invite-кодов. Можно оставить пустым.
+clients:
+  # 987654321:
+  #   role: client
+  #   routers: [id07, id12]
+  #   note: "Вася Петров"
