@@ -1,0 +1,1912 @@
+diff -urN stage2/bot/db.py stage3/bot/db.py
+--- stage2/bot/db.py	2026-04-24 14:55:53.083000414 +0300
++++ stage3/bot/db.py	2026-04-24 14:56:00.740000418 +0300
+@@ -149,6 +149,45 @@
+     key         TEXT PRIMARY KEY,
+     value       TEXT
+ );
++
++-- Stage 3 / Клиент пкт 8: буфер pending-правок списка доменов.
++-- На сессию на клиента-роутер — единый буфер. Переживает рестарт бота.
++CREATE TABLE IF NOT EXISTS pending_routing (
++    tg_id        INTEGER NOT NULL,
++    router_id    TEXT NOT NULL,
++    added_json   TEXT,              -- JSON list of added domains
++    removed_json TEXT,              -- JSON list of removed domains
++    started_at   TEXT DEFAULT (datetime('now')),
++    updated_at   TEXT DEFAULT (datetime('now')),
++    PRIMARY KEY (tg_id, router_id)
++);
++
++-- Stage 3 / Клиент пкт 2: логи от клиентов, присланные админу.
++-- Хранятся 30 дней (job cleanup) + файл в paths.client_logs.
++CREATE TABLE IF NOT EXISTS client_logs (
++    id             INTEGER PRIMARY KEY AUTOINCREMENT,
++    tg_id          INTEGER NOT NULL,
++    username       TEXT,
++    router_id      TEXT NOT NULL,
++    log_path       TEXT,              -- абсолютный путь к файлу
++    preview        TEXT,              -- первые 5 строк для списка
++    read_by_admin  INTEGER NOT NULL DEFAULT 0,
++    created_at     TEXT DEFAULT (datetime('now'))
++);
++CREATE INDEX IF NOT EXISTS idx_client_logs_created ON client_logs(created_at);
++CREATE INDEX IF NOT EXISTS idx_client_logs_router  ON client_logs(router_id, created_at DESC);
++CREATE INDEX IF NOT EXISTS idx_client_logs_unread  ON client_logs(read_by_admin, created_at DESC);
++
++-- Stage 3 / Клиент пкт 7 (доп): история WiFi-правок (без паролей).
++CREATE TABLE IF NOT EXISTS wifi_history (
++    id           INTEGER PRIMARY KEY AUTOINCREMENT,
++    router_id    TEXT NOT NULL,
++    ssid_before  TEXT,
++    ssid_after   TEXT,
++    tg_id        INTEGER,
++    changed_at   TEXT DEFAULT (datetime('now'))
++);
++CREATE INDEX IF NOT EXISTS idx_wifi_history_router ON wifi_history(router_id, changed_at DESC);
+ """
+ 
+ 
+@@ -601,6 +640,124 @@
+             )
+         return self.q("SELECT * FROM audit ORDER BY at DESC LIMIT ?", (limit,))
+ 
++    # Stage 3 / A7: audit по роутеру, пагинация, retention.
++    def audit_by_router(self, router_id: str, offset: int = 0,
++                        limit: int = 30) -> list[sqlite3.Row]:
++        return self.q(
++            "SELECT * FROM audit WHERE router_id=? ORDER BY at DESC LIMIT ? OFFSET ?",
++            (router_id, limit, offset),
++        )
++
++    def audit_count_by_router(self, router_id: str) -> int:
++        row = self.q1(
++            "SELECT COUNT(*) AS c FROM audit WHERE router_id=?",
++            (router_id,),
++        )
++        return int(row["c"]) if row else 0
++
++    def audit_all_by_router(self, router_id: str) -> list[sqlite3.Row]:
++        """Вся история (для CSV-экспорта). Ограничиваем, чтобы не увести bot в OOM."""
++        return self.q(
++            "SELECT * FROM audit WHERE router_id=? ORDER BY at DESC LIMIT 10000",
++            (router_id,),
++        )
++
++    def audit_retention_cleanup(self, days: int = 90) -> int:
++        """Stage 3 / A7: удалить audit-записи старше N дней. Возвращает сколько удалено."""
++        cur = self.ex(
++            "DELETE FROM audit WHERE at < datetime('now', ?)",
++            (f"-{int(days)} days",),
++        )
++        return cur.rowcount or 0
++
++    # =========================================================================
++    # Stage 3 / Клиент пкт 8: pending_routing (буфер правок списка доменов).
++    # =========================================================================
++    def pending_routing_get(self, tg_id: int, router_id: str) -> Optional[sqlite3.Row]:
++        return self.q1(
++            "SELECT * FROM pending_routing WHERE tg_id=? AND router_id=?",
++            (tg_id, router_id),
++        )
++
++    def pending_routing_save(self, tg_id: int, router_id: str,
++                             added: list[str], removed: list[str]) -> None:
++        added_j = json.dumps(added, ensure_ascii=False)
++        removed_j = json.dumps(removed, ensure_ascii=False)
++        self.ex(
++            """INSERT INTO pending_routing(tg_id, router_id, added_json, removed_json, updated_at)
++               VALUES (?,?,?,?, datetime('now'))
++               ON CONFLICT(tg_id, router_id) DO UPDATE SET
++                 added_json=excluded.added_json,
++                 removed_json=excluded.removed_json,
++                 updated_at=excluded.updated_at""",
++            (tg_id, router_id, added_j, removed_j),
++        )
++
++    def pending_routing_clear(self, tg_id: int, router_id: str) -> None:
++        self.ex(
++            "DELETE FROM pending_routing WHERE tg_id=? AND router_id=?",
++            (tg_id, router_id),
++        )
++
++    # =========================================================================
++    # Stage 3 / Клиент пкт 2: client_logs.
++    # =========================================================================
++    def add_client_log(self, tg_id: int, username: str | None, router_id: str,
++                       log_path: str, preview: str) -> int:
++        cur = self.ex(
++            """INSERT INTO client_logs(tg_id, username, router_id, log_path, preview)
++               VALUES (?,?,?,?,?)""",
++            (tg_id, username, router_id, log_path, preview),
++        )
++        return int(cur.lastrowid)
++
++    def get_client_log(self, log_id: int) -> Optional[sqlite3.Row]:
++        return self.q1("SELECT * FROM client_logs WHERE id=?", (log_id,))
++
++    def mark_client_log_read(self, log_id: int) -> None:
++        self.ex("UPDATE client_logs SET read_by_admin=1 WHERE id=?", (log_id,))
++
++    def client_logs_list(self, offset: int = 0, limit: int = 20,
++                         unread_only: bool = False) -> list[sqlite3.Row]:
++        if unread_only:
++            return self.q(
++                """SELECT * FROM client_logs WHERE read_by_admin=0
++                   ORDER BY created_at DESC LIMIT ? OFFSET ?""",
++                (limit, offset),
++            )
++        return self.q(
++            "SELECT * FROM client_logs ORDER BY created_at DESC LIMIT ? OFFSET ?",
++            (limit, offset),
++        )
++
++    def client_logs_unread_count(self) -> int:
++        row = self.q1(
++            "SELECT COUNT(*) AS c FROM client_logs WHERE read_by_admin=0"
++        )
++        return int(row["c"]) if row else 0
++
++    def client_logs_retention_cleanup(self, days: int = 30) -> list[str]:
++        """Удаляет записи старше N дней, возвращает список log_path'ов для удаления с диска."""
++        rows = self.q(
++            "SELECT log_path FROM client_logs WHERE created_at < datetime('now', ?)",
++            (f"-{int(days)} days",),
++        )
++        paths = [r["log_path"] for r in rows if r["log_path"]]
++        self.ex(
++            "DELETE FROM client_logs WHERE created_at < datetime('now', ?)",
++            (f"-{int(days)} days",),
++        )
++        return paths
++
++    # Stage 3 / доп: wifi_history (без паролей).
++    def add_wifi_history(self, router_id: str, ssid_before: str | None,
++                        ssid_after: str | None, tg_id: int | None) -> None:
++        self.ex(
++            """INSERT INTO wifi_history(router_id, ssid_before, ssid_after, tg_id)
++               VALUES (?,?,?,?)""",
++            (router_id, ssid_before, ssid_after, tg_id),
++        )
++
+     # --- rate limits ---
+     def rate_check_and_inc(self, tg_id: int, action: str, limit: int) -> bool:
+         """True если операция разрешена (и счётчик увеличен), False если лимит исчерпан."""
+diff -urN stage2/bot/r_bot.py stage3/bot/r_bot.py
+--- stage2/bot/r_bot.py	2026-04-24 14:55:53.085000414 +0300
++++ stage3/bot/r_bot.py	2026-04-24 14:56:00.746000418 +0300
+@@ -56,6 +56,8 @@
+     all_slots_from_config,
+     cfg_edit_label,
+     discover,
++    do_capture_client_log,
++    do_get_routing,
+     do_get_vless,
+     do_get_wifi,
+     do_global_check,
+@@ -65,6 +67,8 @@
+     do_podkop_logs,
+     do_podkop_restart,
+     do_reboot,
++    do_router_selftest,
++    do_set_routing,
+     do_set_vless,
+     do_set_wifi,
+     mask_vless_for_audit,
+@@ -72,6 +76,7 @@
+     poll_all,
+     poll_router,
+     validate_custom_vless,
++    validate_domain,
+ )
+ 
+ 
+@@ -104,13 +109,29 @@
+         "log": "/var/log/r-bot.log",
+         "runs": "/var/lib/r-bot/runs",
+         "backups": "/var/backups/r-bot",
++        # Stage 3 / Клиент пкт 2: директория для клиентских логов.
++        "client_logs": "/var/lib/r-bot/client_logs",
+     },
+     "rate_limits": {
+         "reboot_per_day": 5,
+         "podkop_restart_per_day": 10,
+         "vless_change_per_day": 20,
+         "global_check_per_day": 50,
++        # Stage 2 / клиент пкт 7:
++        "wifi_change_per_day": 5,
++        # Stage 3 / клиент пкт 8 и 2:
++        "routing_add_per_day": 20,
++        "routing_del_per_day": 20,
++        "send_log_per_day":    5,
+     },
++    # Stage 3 / A7: retention audit (дней).
++    "audit_retention_days":       90,
++    # Stage 3 / клиент пкт 8: потолок списка доменов.
++    "routing_max_domains":        200,
++    # Stage 3 / клиент пкт 2: retention клиентских логов (дней).
++    "client_logs_retention_days": 30,
++    # Stage 3 / A6: куда слать push. Пусто = всем из admins.
++    "admin_chat_ids":             [],
+     "clients": {},
+ }
+ 
+@@ -302,11 +323,18 @@
+ def kb_main_admin(db: DB) -> InlineKeyboardMarkup:
+     pending = len(db.pending_requests())
+     req_label = f"📮 Заявки ({pending})" if pending else "📮 Заявки"
++    # Stage 3 / A7+S3-4: показать бейдж непрочитанных клиентских логов.
++    try:
++        unread_logs = db.client_logs_unread_count()
++    except Exception:
++        unread_logs = 0
++    clog_label = f"📥 Логи от клиентов ({unread_logs})" if unread_logs else "📥 Логи от клиентов"
+     return kb(
+         [
+             [btn("📊 Все роутеры", "list:all:0"), btn("⚠️ Проблемные", "list:bad:0")],
+             [btn("👥 Клиенты", "cli:list"), btn(req_label, "req:list")],
+             [btn("🎟 Коды", "inv:list"), btn("🔗 VLESS-пул", "pool:list")],
++            [btn("🧪 Глобальный тест", "gt:run"), btn(clog_label, "clog:list:0")],
+             [btn("🔔 Mass", "mass:menu"), btn("⚙️ Настройки", "cfg:menu")],
+             [btn("🔄 Обновить данные", "poll:now")],
+         ]
+@@ -367,10 +395,12 @@
+         [btn("♻️ Перезагрузить Роутер (рекомендуется)", f"act:{rid}:boot")],
+         [btn("🔗 Сменить VLESS", f"vless:pick:{rid}:0")],
+         [btn("📶 WiFi", f"wifi:menu:{rid}")],
++        # Stage 3 / Клиент пкт 8: маршрутизация всем привязанным.
++        [btn("📋 Маршрутизация", f"rt:menu:{rid}")],
+     ]
+     if is_admin_user:
+         rows.append([btn("📜 Logs", f"act:{rid}:logs"), btn("📜 Podkop logs", f"act:{rid}:plogs")])
+-        rows.append([btn("ℹ️ Info", f"act:{rid}:info")])
++        rows.append([btn("ℹ️ Info", f"act:{rid}:info"), btn("📜 Аудит роутера", f"aud:r:{rid}:0")])
+         # A2: custom VLESS / возврат в пул — взаимоисключающие.
+         if custom_vless:
+             rows.append([btn("🔁 Вернуть в пул", f"vless:pool:{rid}")])
+@@ -447,8 +477,24 @@
+     # Автозавод admin'ов из cfg.admins при первом /start
+     if u.id in cfg.get("admins", []):
+         db.set_admin(u.id, u.username)
++    # Stage 3 / A6: если клиент ранее не был в БД — уведомить админа о первом /start.
++    is_new_client = (
++        db.get_client(u.id) is None
++        and u.id not in cfg.get("admins", [])
++    )
+     db.upsert_client(u.id, u.username, u.first_name, role=db.get_client(u.id)["role"] if db.get_client(u.id) else "client")
+     db.touch_seen(u.id)
++    if is_new_client:
++        try:
++            await _push_admins(
++                ctx,
++                f"👋 <b>Новый клиент /start</b>\n"
++                f"@{esc(u.username or '—')} "
++                f"(<code>{u.id}</code>, {esc(u.first_name or '')})",
++                kb([[btn("👥 Клиенты", "cli:list")]]),
++            )
++        except Exception:
++            pass
+ 
+     role = user_role(ctx, u.id)
+     if role == "admin":
+@@ -1007,12 +1053,13 @@
+                 f"VERDICT: <b>{verdict}</b>\n"
+                 f"(лог {len(full.splitlines())} строк · {size_kb:.1f} KB)"
+             )
+-            kb_ = kb(
+-                [
+-                    [btn("📄 Полный лог", f"log:send:{rid}:{log_path.name}")],
+-                    [btn("🔁 Повторить", f"act:{rid}:check"), btn("← назад", f"r:{rid}")],
+-                ]
+-            )
++            rows_kb = [
++                [btn("📄 Полный лог", f"log:send:{rid}:{log_path.name}")],
++                # Stage 3 / Client пкт 2: отправить лог админу
++                [btn("📤 Отправить лог админу", f"lga:{rid}:{log_path.name}")],
++                [btn("🔁 Повторить", f"act:{rid}:check"), btn("← назад", f"r:{rid}")],
++            ]
++            kb_ = kb(rows_kb)
+             db.audit(u.id, u.username, rid, "global_check", None, verdict)
+             await reply_or_edit(update, text, kb_)
+ 
+@@ -1603,7 +1650,23 @@
+     if ok:
+         db.set_wifi_snapshot(rid, new_ssid, "psk2")
+         db.audit(u.id, u.username, rid, "wifi_change", args_audit, "ok")
++        try:
++            db.add_wifi_history(rid, old_ssid, new_ssid, u.id)
++        except Exception:
++            log.exception("wifi_history")
+         log.info("wifi change %s by %s -> ok (ssid=%s)", rid, u.id, new_ssid)
++        # Stage 3 / A6: push админу, если менял клиент.
++        try:
++            if role != "admin":
++                await _push_admins(
++                    ctx,
++                    f"📶 <b>{rid}</b> (@{esc(u.username or u.first_name or u.id)}): "
++                    f"сменён WiFi\n"
++                    f"SSID: <code>{esc(old_ssid or '—')}</code> → <code>{esc(new_ssid)}</code>",
++                    kb([[btn("📜 История", f"aud:r:{rid}:0")]]),
++                )
++        except Exception:
++            log.exception("push admin wifi")
+         text = (
+             f"<b>{rid}</b> ✅\n\nWiFi обновлён. Все устройства должны переподключиться "
+             f"с новым паролем.\n\nНовая сеть: <b>{esc(new_ssid)}</b>"
+@@ -1725,6 +1788,1013 @@
+ 
+ 
+ # =============================================================================
++# Stage 3 / Клиент пкт 8: Маршрутизация (user_domains)
++# =============================================================================
++# Меню: cb_rt_menu → рисует список + кнопки [➕ Добавить] [✏ Убрать] [✅ Применить]
++# Flow:
++#   ➕ Добавить → state=awaiting_routing_add (rid); text-handler принимает
++#      по одному или столбиком домены, валидирует, кладёт в pending_routing.added.
++#   ✏ Убрать → cb_rt_remove_list (страница по 10, каждая кнопка — домен).
++#      Клик по домену → убирает из effective или добавляет в removed.
++#   ✅ Применить → diff preview → kb_confirm → cb_rt_apply.
++# Лимиты для клиента: 20 add/день, 20 del/день, итог ≤ 200 доменов.
++
++RT_PAGE_SIZE = 10
++
++
++async def _rt_current_state(db: DB, rid: str, ctx: ContextTypes.DEFAULT_TYPE,
++                            tg_id: int) -> tuple[bool, list[str], list[str],
++                                                  list[str], str]:
++    """Возвращает (ok, server_list, added, removed, err).
++
++    server_list — что сейчас на роутере (uci get).
++    added — JSON pending.added_json (не применённые добавления).
++    removed — JSON pending.removed_json (не применённые удаления)."""
++    rcfg: dict = ctx.application.bot_data["r_config"]
++    r = router_by_id(ctx, rid)
++    if r is None:
++        return False, [], [], [], "роутер offline"
++    loop = asyncio.get_event_loop()
++    ok, domains, err = await loop.run_in_executor(
++        None, do_get_routing, r, rcfg["ssh"]
++    )
++    if not ok:
++        return False, [], [], [], err
++    added: list[str] = []
++    removed: list[str] = []
++    pend = db.pending_routing_get(tg_id, rid)
++    if pend is not None:
++        try:
++            added = json.loads(pend["added_json"] or "[]")
++        except (json.JSONDecodeError, TypeError):
++            added = []
++        try:
++            removed = json.loads(pend["removed_json"] or "[]")
++        except (json.JSONDecodeError, TypeError):
++            removed = []
++    return True, domains, added, removed, ""
++
++
++def _rt_effective(server: list[str], added: list[str],
++                  removed: list[str]) -> list[str]:
++    """Эффективный список после применения: server − removed + added (без дублей)."""
++    present = {d.lower() for d in server}
++    rm = {d.lower() for d in removed}
++    result = [d for d in server if d.lower() not in rm]
++    for d in added:
++        if d.lower() not in present:
++            result.append(d)
++    return result
++
++
++async def cb_rt_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
++    q = update.callback_query
++    _, _, rid = q.data.split(":")
++    u = update.effective_user
++    if not u or not client_owns_router(ctx, u.id, rid):
++        await reply_or_edit(update, "Нет доступа.",
++                            kb([[btn("← Главная", "menu:main")]]))
++        return
++
++    db: DB = ctx.application.bot_data["db"]
++    # Проверка lifecycle
++    st = db.get_state(rid)
++    lifecycle = _row_lifecycle(st)
++    role = user_role(ctx, u.id)
++    is_admin_user = (role == "admin")
++    if lifecycle in ("transit", "maintenance") and not is_admin_user:
++        await reply_or_edit(
++            update,
++            f"<b>{rid}</b>\n\n🛠 Сейчас идут техработы, маршрутизация недоступна.",
++            kb([[btn("← назад", f"r:{rid}")]]),
++        )
++        return
++
++    await reply_or_edit(update, f"<b>{rid}</b> — читаю список доменов…")
++    ok, server, added, removed, err = await _rt_current_state(db, rid, ctx, u.id)
++    if not ok:
++        await reply_or_edit(
++            update, f"<b>{rid}</b> ❌\n<pre>{esc(err[:300])}</pre>",
++            kb([[btn("← назад", f"r:{rid}")]]),
++        )
++        return
++    effective = _rt_effective(server, added, removed)
++
++    lines = [
++        f"📋 <b>Маршрутизация {rid}</b>",
++        "━━━━━━━━━━━━━━━━━━━━",
++        f"На роутере сейчас: <b>{len(server)}</b>",
++    ]
++    if added or removed:
++        lines.append(
++            f"Pending: ➕{len(added)} / ➖{len(removed)} "
++            f"→ итог <b>{len(effective)}</b>"
++        )
++    if len(effective) > 200:
++        lines.append("⚠ итог превышает 200 — для клиента отказ при apply")
++    lines.append("")
++    if not effective:
++        lines.append("<i>(список пуст — маршрутизация отключена)</i>")
++    else:
++        # Показываем первые 30 (до переполнения сообщения TG)
++        display = effective[:30]
++        for i, d in enumerate(display, 1):
++            tag = ""
++            dl = d.lower()
++            if dl in (a.lower() for a in added):
++                tag = "  <i>(pending ➕)</i>"
++            lines.append(f"{i}. <code>{esc(d)}</code>{tag}")
++        if len(effective) > 30:
++            lines.append(f"… ещё {len(effective) - 30} доменов")
++
++    rows: list = []
++    rows.append([
++        btn("➕ Добавить", f"rt:add:{rid}"),
++        btn("✏ Убрать", f"rt:rmlist:{rid}:0"),
++    ])
++    if added or removed:
++        rows.append([
++            btn("✅ Применить", f"rt:preview:{rid}"),
++            btn("♻ Сбросить правки", f"rt:reset:{rid}"),
++        ])
++    rows.append([btn("🔄 Обновить", f"rt:menu:{rid}")])
++    rows.append([btn("← назад", f"r:{rid}")])
++    await reply_or_edit(update, "\n".join(lines), kb(rows))
++
++
++async def cb_rt_add_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
++    q = update.callback_query
++    _, _, rid = q.data.split(":")
++    u = update.effective_user
++    if not u or not client_owns_router(ctx, u.id, rid):
++        await q.answer("Нет доступа", show_alert=True)
++        return
++    ctx.user_data["state"] = "awaiting_routing_add"
++    ctx.user_data["state_rid"] = rid
++    await reply_or_edit(
++        update,
++        f"📋 <b>{rid}</b> — добавить домены\n\n"
++        "Пришли один домен или список столбиком (по одному на строку).\n\n"
++        "Только латиница+цифры+дефис, без <code>http://</code>, "
++        "<code>www.</code>, портов, путей и IP.\n\n"
++        "Например:\n"
++        "<code>youtube.com\nchatgpt.com\n2ip.ru</code>\n\n"
++        "/cancel чтобы отменить.",
++        kb([[btn("← Отмена", f"rt:menu:{rid}")]]),
++    )
++
++
++async def cb_rt_remove_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
++    """Список доменов с кнопками для удаления. Клик — добавить в removed."""
++    q = update.callback_query
++    parts = q.data.split(":")
++    # rt:rmlist:<rid>:<page>
++    _, _, rid, page_s = parts
++    page = int(page_s)
++    u = update.effective_user
++    if not u or not client_owns_router(ctx, u.id, rid):
++        await q.answer("Нет доступа", show_alert=True)
++        return
++    db: DB = ctx.application.bot_data["db"]
++    ok, server, added, removed, err = await _rt_current_state(db, rid, ctx, u.id)
++    if not ok:
++        await reply_or_edit(
++            update, f"❌ {esc(err)}",
++            kb([[btn("← назад", f"rt:menu:{rid}")]]),
++        )
++        return
++    effective = _rt_effective(server, added, removed)
++    if not effective:
++        await reply_or_edit(
++            update, f"<b>{rid}</b>\n\n<i>(список пуст)</i>",
++            kb([[btn("← назад", f"rt:menu:{rid}")]]),
++        )
++        return
++    start = page * RT_PAGE_SIZE
++    chunk = effective[start : start + RT_PAGE_SIZE]
++    total_pages = (len(effective) + RT_PAGE_SIZE - 1) // RT_PAGE_SIZE
++
++    lines = [
++        f"📋 <b>{rid}</b> — нажми на домен чтобы убрать",
++        f"Стр. {page + 1}/{total_pages}",
++        "",
++    ]
++    rows: list = []
++    for i, d in enumerate(chunk, start=start + 1):
++        tag = " pending-add" if d in added else ""
++        lines.append(f"{i}. <code>{esc(d)}</code>{tag}")
++        rows.append([btn(f"✖ {d[:40]}", f"rt:rmone:{rid}:{start + i - start - 1}")])
++        # Индекс domain'а внутри effective[] для rt:rmone.
++    # Переделаем: проще и честнее передать сам домен, но callback_data ограничен
++    # 64 байтами. Для длинных доменов fallback на индекс.
++    rows = []
++    for i, d in enumerate(chunk):
++        # Пытаемся передать сам домен, урезая до 45 символов под callback-лимит
++        # (префикс «rt:rmone:idNNN:» занимает ~15 байт).
++        cb = f"rt:rmone:{rid}:{d}"
++        if len(cb.encode("utf-8")) > 64:
++            # Слишком длинный — кодируем индекс в effective.
++            global_idx = start + i
++            cb = f"rt:rmoneI:{rid}:{global_idx}"
++        rows.append([btn(f"✖ {d[:40]}", cb)])
++    # Пагинация
++    pager: list = []
++    if page > 0:
++        pager.append(btn("‹", f"rt:rmlist:{rid}:{page - 1}"))
++    pager.append(btn(f"{page + 1}/{total_pages}", "noop"))
++    if page + 1 < total_pages:
++        pager.append(btn("›", f"rt:rmlist:{rid}:{page + 1}"))
++    if pager:
++        rows.append(pager)
++    rows.append([btn("← назад", f"rt:menu:{rid}")])
++    await reply_or_edit(update, "\n".join(lines), kb(rows))
++
++
++async def cb_rt_rmone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
++    """Убрать один домен (из добавленного — снять, из server — добавить в removed)."""
++    q = update.callback_query
++    parts = q.data.split(":", 3)
++    # rt:rmone:<rid>:<domain>  или  rt:rmoneI:<rid>:<idx>
++    if len(parts) != 4:
++        await q.answer("bad callback", show_alert=True)
++        return
++    _, mode, rid, payload = parts
++    u = update.effective_user
++    if not u or not client_owns_router(ctx, u.id, rid):
++        await q.answer("Нет доступа", show_alert=True)
++        return
++    db: DB = ctx.application.bot_data["db"]
++    ok, server, added, removed, err = await _rt_current_state(db, rid, ctx, u.id)
++    if not ok:
++        await reply_or_edit(update, f"❌ {esc(err)}",
++                            kb([[btn("← назад", f"rt:menu:{rid}")]]))
++        return
++    effective = _rt_effective(server, added, removed)
++    if mode == "rmoneI":
++        try:
++            idx = int(payload)
++            domain = effective[idx]
++        except (ValueError, IndexError):
++            await q.answer("не найден", show_alert=True)
++            return
++    else:
++        domain = payload
++    if domain not in effective:
++        await q.answer("уже удалён", show_alert=False)
++    else:
++        # Rate-limit для клиента (кроме admin): считаем «удаления».
++        cfg: dict = ctx.application.bot_data["cfg"]
++        role = user_role(ctx, u.id)
++        if role != "admin":
++            limit = cfg["rate_limits"].get("routing_del_per_day", 20)
++            if limit > 0 and not db.rate_check_and_inc(u.id, "routing_del", limit):
++                await q.answer(f"Лимит {limit}/день", show_alert=True)
++                await cb_rt_menu_redraw(update, ctx, rid)
++                return
++        # Если домен был в server — кладём в removed; если был в added — снимаем.
++        dl = domain.lower()
++        if any(a.lower() == dl for a in added):
++            added = [a for a in added if a.lower() != dl]
++        else:
++            if not any(r.lower() == dl for r in removed):
++                removed.append(domain)
++        db.pending_routing_save(u.id, rid, added, removed)
++    await cb_rt_menu_redraw(update, ctx, rid)
++
++
++async def cb_rt_menu_redraw(update: Update, ctx: ContextTypes.DEFAULT_TYPE, rid: str):
++    """Перерисовать главное меню rt после правки."""
++    # Переиспользуем cb_rt_menu, подменив callback_data на q.
++    q = update.callback_query
++    # Эмулируем q.data = "rt:menu:rid"
++    class _FakeQ:
++        data = f"rt:menu:{rid}"
++    # Чисто: просто вызываем handler, но q уже у нас есть — меняем data обходом:
++    # Проще — вызвать функцию с прямым rid. Сделаем так: просто продублируем логику.
++    u = update.effective_user
++    db: DB = ctx.application.bot_data["db"]
++    ok, server, added, removed, err = await _rt_current_state(db, rid, ctx, u.id)
++    if not ok:
++        await reply_or_edit(update, f"❌ {esc(err)}",
++                            kb([[btn("← назад", f"r:{rid}")]]))
++        return
++    effective = _rt_effective(server, added, removed)
++    lines = [
++        f"📋 <b>Маршрутизация {rid}</b>",
++        "━━━━━━━━━━━━━━━━━━━━",
++        f"На роутере: <b>{len(server)}</b>",
++    ]
++    if added or removed:
++        lines.append(f"Pending: ➕{len(added)} / ➖{len(removed)} → итог <b>{len(effective)}</b>")
++    if len(effective) > 200:
++        lines.append("⚠ итог > 200")
++    rows = [[
++        btn("➕ Добавить", f"rt:add:{rid}"),
++        btn("✏ Убрать", f"rt:rmlist:{rid}:0"),
++    ]]
++    if added or removed:
++        rows.append([
++            btn("✅ Применить", f"rt:preview:{rid}"),
++            btn("♻ Сбросить правки", f"rt:reset:{rid}"),
++        ])
++    rows.append([btn("🔄 Обновить", f"rt:menu:{rid}")])
++    rows.append([btn("← назад", f"r:{rid}")])
++    await reply_or_edit(update, "\n".join(lines), kb(rows))
++
++
++async def cb_rt_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
++    q = update.callback_query
++    _, _, rid = q.data.split(":")
++    u = update.effective_user
++    if not u or not client_owns_router(ctx, u.id, rid):
++        await q.answer("Нет доступа", show_alert=True)
++        return
++    db: DB = ctx.application.bot_data["db"]
++    db.pending_routing_clear(u.id, rid)
++    await q.answer("Pending-правки сброшены")
++    await cb_rt_menu_redraw(update, ctx, rid)
++
++
++async def cb_rt_preview(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
++    """Показать diff и кнопку Применить."""
++    q = update.callback_query
++    _, _, rid = q.data.split(":")
++    u = update.effective_user
++    if not u or not client_owns_router(ctx, u.id, rid):
++        await q.answer("Нет доступа", show_alert=True)
++        return
++    db: DB = ctx.application.bot_data["db"]
++    ok, server, added, removed, err = await _rt_current_state(db, rid, ctx, u.id)
++    if not ok:
++        await reply_or_edit(update, f"❌ {esc(err)}",
++                            kb([[btn("← назад", f"rt:menu:{rid}")]]))
++        return
++    effective = _rt_effective(server, added, removed)
++    cfg: dict = ctx.application.bot_data["cfg"]
++    role = user_role(ctx, u.id)
++    max_domains = cfg.get("routing_max_domains", 200)
++    if role != "admin" and len(effective) > max_domains:
++        await reply_or_edit(
++            update,
++            f"❌ <b>{rid}</b>: итог будет <b>{len(effective)}</b> доменов, "
++            f"максимум <b>{max_domains}</b>.\n"
++            "Снимай часть добавлений или удаляй лишнее.",
++            kb([[btn("← назад", f"rt:menu:{rid}")]]),
++        )
++        return
++    if not added and not removed:
++        await reply_or_edit(
++            update, "Нечего применять.",
++            kb([[btn("← назад", f"rt:menu:{rid}")]]),
++        )
++        return
++
++    lines = [f"📋 <b>{rid}</b> — подтверди изменения", ""]
++    if added:
++        lines.append(f"➕ <b>Добавить ({len(added)}):</b>")
++        for d in added[:20]:
++            lines.append(f"   <code>{esc(d)}</code>")
++        if len(added) > 20:
++            lines.append(f"   … ещё {len(added) - 20}")
++        lines.append("")
++    if removed:
++        lines.append(f"➖ <b>Убрать ({len(removed)}):</b>")
++        for d in removed[:20]:
++            lines.append(f"   <code>{esc(d)}</code>")
++        if len(removed) > 20:
++            lines.append(f"   … ещё {len(removed) - 20}")
++        lines.append("")
++    lines.append(f"Итоговый размер: <b>{len(effective)}</b>")
++    lines.append("")
++    lines.append("⚠ После применения служба перезапустится, интернет моргнёт 5–10 сек.")
++    await reply_or_edit(
++        update, "\n".join(lines),
++        kb([
++            [btn("✅ Применить", f"rt:apply:{rid}"),
++             btn("✖ Отмена", f"rt:menu:{rid}")],
++        ]),
++    )
++
++
++async def cb_rt_apply(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
++    q = update.callback_query
++    _, _, rid = q.data.split(":")
++    u = update.effective_user
++    if not u or not client_owns_router(ctx, u.id, rid):
++        await q.answer("Нет доступа", show_alert=True)
++        return
++    db: DB = ctx.application.bot_data["db"]
++    cfg: dict = ctx.application.bot_data["cfg"]
++    rcfg: dict = ctx.application.bot_data["r_config"]
++    log = ctx.application.bot_data["log"]
++
++    ok, server, added, removed, err = await _rt_current_state(db, rid, ctx, u.id)
++    if not ok:
++        await reply_or_edit(update, f"❌ {esc(err)}",
++                            kb([[btn("← назад", f"rt:menu:{rid}")]]))
++        return
++    if not added and not removed:
++        await reply_or_edit(update, "Нечего применять.",
++                            kb([[btn("← назад", f"rt:menu:{rid}")]]))
++        return
++    r = router_by_id(ctx, rid)
++    if r is None:
++        db.audit(u.id, u.username, rid, "routing_apply", None, "fail: offline")
++        await reply_or_edit(update, f"{rid} offline — применение невозможно.",
++                            kb([[btn("← назад", f"rt:menu:{rid}")]]))
++        return
++
++    await reply_or_edit(update, f"Применяю маршрутизацию на {rid}…")
++    loop = asyncio.get_event_loop()
++    ok2, msg = await loop.run_in_executor(
++        None, do_set_routing, r, rcfg["ssh"], added, removed
++    )
++    payload = json.dumps({"added": added, "removed": removed,
++                          "size_after": len(_rt_effective(server, added, removed))},
++                         ensure_ascii=False)
++    if ok2:
++        db.pending_routing_clear(u.id, rid)
++        db.audit(u.id, u.username, rid, "routing_apply", payload, "ok")
++        log.info("routing_apply %s by %s -> ok", rid, u.id)
++        # Stage 3 / A6: push админу, если менял клиент.
++        try:
++            if user_role(ctx, u.id) != "admin":
++                await _push_admins(
++                    ctx,
++                    f"⚙ <b>{rid}</b> (@{esc(u.username or u.first_name or u.id)}): "
++                    f"обновлена маршрутизация\n"
++                    f"+{len(added)} / −{len(removed)} (итог {len(_rt_effective(server, added, removed))})",
++                    kb([[btn("📜 История", f"aud:r:{rid}:0")]]),
++                )
++        except Exception:
++            log.exception("push admin routing")
++        text = (
++            f"<b>{rid}</b> ✅\n\nМаршрутизация обновлена.\n"
++            f"Добавлено: {len(added)} · убрано: {len(removed)}."
++        )
++    else:
++        db.audit(u.id, u.username, rid, "routing_apply", payload, f"fail: {msg}")
++        text = f"<b>{rid}</b> ❌\n<pre>{esc(msg[:500])}</pre>"
++    await reply_or_edit(
++        update, text,
++        kb([
++            [btn("📋 К меню", f"rt:menu:{rid}")],
++            [btn("← к роутеру", f"r:{rid}")],
++        ]),
++    )
++
++
++# =============================================================================
++# Stage 3 / Клиент пкт 2: отправить лог админу
++# =============================================================================
++
++async def cb_log_to_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
++    """Клиент нажимает «📤 Отправить лог админу» после global check.
++    Формат callback: `lga:<rid>:<fname>` — fname — имя файла в runs/ с
++    глобальным check."""
++    q = update.callback_query
++    parts = q.data.split(":", 2)
++    if len(parts) != 3:
++        await q.answer("bad callback", show_alert=True)
++        return
++    _, rid, fname = parts
++    u = update.effective_user
++    if not u or not client_owns_router(ctx, u.id, rid):
++        await q.answer("Нет доступа", show_alert=True)
++        return
++    db: DB = ctx.application.bot_data["db"]
++    cfg: dict = ctx.application.bot_data["cfg"]
++    rcfg: dict = ctx.application.bot_data["r_config"]
++    log = ctx.application.bot_data["log"]
++
++    role = user_role(ctx, u.id)
++    # Лимит клиенту 5/день (админ не отправляет — кнопка ему и так не показывается)
++    if role != "admin":
++        limit = cfg["rate_limits"].get("send_log_per_day", 5)
++        if limit > 0 and not db.rate_check_and_inc(u.id, "send_log", limit):
++            await reply_or_edit(
++                update,
++                f"❌ Лимит {limit}/день исчерпан, вернись завтра или "
++                "попроси админа связаться с тобой.",
++                kb([[btn("← назад", f"r:{rid}")]]),
++            )
++            return
++
++    # Собираем лог
++    await reply_or_edit(update, f"<b>{rid}</b> — собираю лог для админа…")
++    base_log = ""
++    check_path = Path(cfg["paths"]["runs"]) / rid / fname
++    if check_path.exists() and check_path.is_file():
++        try:
++            base_log = check_path.read_text(encoding="utf-8", errors="replace")
++        except Exception:
++            base_log = ""
++    r = router_by_id(ctx, rid)
++    full_body = ""
++    if r is not None:
++        loop = asyncio.get_event_loop()
++        try:
++            full_body = await loop.run_in_executor(
++                None, do_capture_client_log, r, rcfg["ssh"], base_log
++            )
++        except Exception as e:
++            full_body = f"(capture failed: {e})\n\n{base_log}"
++    else:
++        full_body = (
++            "(роутер offline — прикрепляю только вывод global_check)\n\n"
++            + base_log
++        )
++
++    # Сохраняем файл
++    client_logs_dir = Path(cfg["paths"]["client_logs"]) / rid
++    try:
++        client_logs_dir.mkdir(parents=True, exist_ok=True)
++    except Exception as e:
++        log.exception("mkdir client_logs")
++        await reply_or_edit(
++            update, f"❌ Не могу записать файл: {esc(e)}",
++            kb([[btn("← назад", f"r:{rid}")]]),
++        )
++        return
++    ts = dt.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
++    fpath = client_logs_dir / f"log_{rid}_{ts}.txt"
++    try:
++        fpath.write_text(full_body, encoding="utf-8")
++    except Exception as e:
++        log.exception("write client log")
++        await reply_or_edit(
++            update, f"❌ Не могу записать файл: {esc(e)}",
++            kb([[btn("← назад", f"r:{rid}")]]),
++        )
++        return
++
++    preview_lines = full_body.strip().splitlines()[:5]
++    preview = "\n".join(preview_lines)[:500]
++    log_id = db.add_client_log(u.id, u.username, rid, str(fpath), preview)
++    db.audit(u.id, u.username, rid, "send_log_to_admin",
++             f"log_id={log_id} size={len(full_body)}", "ok")
++    log.info("client log %s: %s -> %s", log_id, u.id, fpath)
++
++    # Пуш админу с файлом + превью
++    caption = (
++        f"🆘 <b>Лог от клиента</b>\n"
++        f"Роутер: <b>{rid}</b>\n"
++        f"Клиент: @{esc(u.username or u.first_name or u.id)} "
++        f"(<code>{u.id}</code>)\n\n"
++        f"Превью:\n<pre>{esc(preview)[:600]}</pre>"
++    )
++    try:
++        targets = _admin_chat_ids(ctx)
++        for admin_id in targets:
++            try:
++                with open(fpath, "rb") as fh:
++                    await ctx.bot.send_document(
++                        admin_id,
++                        document=InputFile(fh, filename=fpath.name),
++                        caption=caption,
++                        parse_mode=ParseMode.HTML,
++                        reply_markup=kb([
++                            [btn("👁 Прочитано", f"clog:read:{log_id}")],
++                            [btn("📜 Аудит роутера", f"aud:r:{rid}:0")],
++                        ]),
++                    )
++            except Exception:
++                log.exception("send client log to %s", admin_id)
++    except Exception:
++        log.exception("dispatch client log")
++
++    await reply_or_edit(
++        update,
++        f"<b>{rid}</b> ✅\n\nЛог отправлен админу. Жди ответа.",
++        kb([[btn("← назад", f"r:{rid}")]]),
++    )
++
++
++async def cb_clog_read(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
++    """Админ помечает лог прочитанным."""
++    q = update.callback_query
++    _, _, log_s = q.data.split(":")
++    u = update.effective_user
++    if not u or not is_admin(ctx, u.id):
++        await q.answer("Только админ", show_alert=True)
++        return
++    try:
++        log_id = int(log_s)
++    except ValueError:
++        await q.answer("bad id", show_alert=True)
++        return
++    db: DB = ctx.application.bot_data["db"]
++    db.mark_client_log_read(log_id)
++    await q.answer("Помечено прочитанным")
++
++
++async def cb_client_logs_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
++    """Админ: меню 📥 Логи от клиентов."""
++    q = update.callback_query
++    u = update.effective_user
++    if not u or not is_admin(ctx, u.id):
++        await q.answer("Только админ", show_alert=True)
++        return
++    parts = q.data.split(":")
++    # clog:list[:page] или clog:list:unread[:page]
++    page = 0
++    unread_only = False
++    if len(parts) >= 3 and parts[2] == "unread":
++        unread_only = True
++        if len(parts) >= 4:
++            try:
++                page = int(parts[3])
++            except ValueError:
++                page = 0
++    elif len(parts) >= 3:
++        try:
++            page = int(parts[2])
++        except ValueError:
++            page = 0
++    db: DB = ctx.application.bot_data["db"]
++    PAGE = 10
++    logs = db.client_logs_list(offset=page * PAGE, limit=PAGE, unread_only=unread_only)
++    unread = db.client_logs_unread_count()
++    filter_label = "🆕 Только непрочитанные" if not unread_only else "📋 Все логи"
++    filter_cb = ("clog:list:unread:0") if not unread_only else ("clog:list:0")
++    lines = [
++        f"📥 <b>Логи от клиентов</b>",
++        f"Непрочитанных: <b>{unread}</b>",
++        "",
++    ]
++    if not logs:
++        lines.append("<i>(пусто)</i>")
++    rows: list = []
++    for row in logs:
++        try:
++            lid = row["id"]
++            uname = row["username"] or str(row["tg_id"])
++            rid = row["router_id"]
++            ts = row["created_at"]
++            unread_flag = not row["read_by_admin"]
++        except (IndexError, KeyError):
++            continue
++        tag = "🆕 " if unread_flag else ""
++        btn_label = f"{tag}{rid} · @{uname[:15]} · {ts[:16]}"
++        rows.append([btn(btn_label, f"clog:view:{lid}")])
++    rows.append([btn(filter_label, filter_cb)])
++    rows.append([btn("← назад", "cfg:menu")])
++    await reply_or_edit(update, "\n".join(lines), kb(rows))
++
++
++async def cb_client_log_view(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
++    q = update.callback_query
++    _, _, lid_s = q.data.split(":")
++    u = update.effective_user
++    if not u or not is_admin(ctx, u.id):
++        await q.answer("Только админ", show_alert=True)
++        return
++    try:
++        lid = int(lid_s)
++    except ValueError:
++        await q.answer("bad id", show_alert=True)
++        return
++    db: DB = ctx.application.bot_data["db"]
++    row = db.get_client_log(lid)
++    if row is None:
++        await reply_or_edit(update, "Лог не найден (удалён?).",
++                            kb([[btn("← к списку", "clog:list:0")]]))
++        return
++    try:
++        rid = row["router_id"]
++        uname = row["username"] or ""
++        tgid = row["tg_id"]
++        created = row["created_at"]
++        lpath = row["log_path"] or ""
++        preview = row["preview"] or ""
++    except (IndexError, KeyError):
++        await reply_or_edit(update, "Лог повреждён.",
++                            kb([[btn("← к списку", "clog:list:0")]]))
++        return
++    db.mark_client_log_read(lid)
++    text = (
++        f"🆘 <b>Лог #{lid}</b>\n"
++        f"Роутер: <b>{rid}</b>\n"
++        f"Клиент: @{esc(uname or tgid)} (<code>{tgid}</code>)\n"
++        f"Дата: {esc(created)}\n\n"
++        f"Превью:\n<pre>{esc(preview)[:700]}</pre>"
++    )
++    rows: list = []
++    if lpath and Path(lpath).exists():
++        rows.append([btn("📎 Скачать файл", f"clog:file:{lid}")])
++    rows.append([btn("📜 Аудит роутера", f"aud:r:{rid}:0")])
++    rows.append([btn("← к списку", "clog:list:0")])
++    await reply_or_edit(update, text, kb(rows))
++
++
++async def cb_client_log_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
++    q = update.callback_query
++    _, _, lid_s = q.data.split(":")
++    u = update.effective_user
++    if not u or not is_admin(ctx, u.id):
++        await q.answer("Только админ", show_alert=True)
++        return
++    try:
++        lid = int(lid_s)
++    except ValueError:
++        await q.answer("bad id", show_alert=True)
++        return
++    db: DB = ctx.application.bot_data["db"]
++    row = db.get_client_log(lid)
++    if row is None:
++        await q.answer("лог не найден", show_alert=True)
++        return
++    try:
++        lpath = row["log_path"]
++        rid = row["router_id"]
++    except (IndexError, KeyError):
++        await q.answer("повреждён", show_alert=True)
++        return
++    p = Path(lpath)
++    if not p.exists():
++        await q.message.reply_text("Файл уже удалён (>30 дней?).")
++        return
++    await q.answer()
++    with open(p, "rb") as fh:
++        await q.message.reply_document(
++            document=InputFile(fh, filename=p.name),
++            caption=f"{rid} / лог #{lid}",
++        )
++
++
++# =============================================================================
++# Stage 3 / A6: push-уведомления админу
++# =============================================================================
++
++def _admin_chat_ids(ctx: ContextTypes.DEFAULT_TYPE) -> list[int]:
++    cfg: dict = ctx.application.bot_data["cfg"]
++    explicit = cfg.get("admin_chat_ids") or []
++    if explicit:
++        return [int(x) for x in explicit]
++    return [int(x) for x in (cfg.get("admins") or [])]
++
++
++async def _push_admins(ctx: ContextTypes.DEFAULT_TYPE, text: str,
++                       reply_markup=None) -> None:
++    """Разослать админам сообщение. Все ошибки проглотить (логируем)."""
++    log = ctx.application.bot_data.get("log")
++    for admin_id in _admin_chat_ids(ctx):
++        try:
++            await ctx.bot.send_message(
++                admin_id, text,
++                parse_mode=ParseMode.HTML,
++                reply_markup=reply_markup,
++            )
++        except Exception:
++            if log:
++                log.exception("push admin %s", admin_id)
++
++
++# =============================================================================
++# Stage 3 / A7: audit-лог UI (по роутеру)
++# =============================================================================
++
++AUDIT_PAGE = 15
++
++
++async def cb_audit_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
++    """aud:r:<rid>:<page>"""
++    q = update.callback_query
++    parts = q.data.split(":")
++    if len(parts) != 4:
++        await q.answer("bad callback", show_alert=True)
++        return
++    _, _, rid, page_s = parts
++    try:
++        page = int(page_s)
++    except ValueError:
++        page = 0
++    u = update.effective_user
++    if not u or not is_admin(ctx, u.id):
++        await q.answer("Только админ", show_alert=True)
++        return
++    db: DB = ctx.application.bot_data["db"]
++    total = db.audit_count_by_router(rid)
++    rows_data = db.audit_by_router(rid, offset=page * AUDIT_PAGE, limit=AUDIT_PAGE)
++    total_pages = max(1, (total + AUDIT_PAGE - 1) // AUDIT_PAGE)
++    lines = [
++        f"📜 <b>Аудит {rid}</b>",
++        f"Всего записей: <b>{total}</b>",
++        f"Стр. {page + 1}/{total_pages}",
++        "",
++    ]
++    if not rows_data:
++        lines.append("<i>(нет записей)</i>")
++    for a in rows_data:
++        try:
++            at = a["at"] or ""
++            actor = a["username"] or (str(a["tg_id"]) if a["tg_id"] else "system")
++            act = a["action"] or ""
++            res = a["result"] or ""
++            args = a["args"] or ""
++        except (IndexError, KeyError):
++            continue
++        res_short = "✅" if res.startswith("ok") else "❌" if res.startswith("fail") else "·"
++        line = f"<code>{esc(at[:16])}</code> · @{esc(actor)} · {esc(act)} {res_short}"
++        if args and len(args) < 80:
++            line += f"\n   <i>{esc(args)}</i>"
++        lines.append(line)
++    pager: list = []
++    if page > 0:
++        pager.append(btn("‹", f"aud:r:{rid}:{page - 1}"))
++    pager.append(btn(f"{page + 1}/{total_pages}", "noop"))
++    if page + 1 < total_pages:
++        pager.append(btn("›", f"aud:r:{rid}:{page + 1}"))
++    rows: list = []
++    if pager:
++        rows.append(pager)
++    rows.append([btn("📥 Экспорт CSV", f"aud:csv:{rid}")])
++    rows.append([btn("← к роутеру", f"r:{rid}")])
++    await reply_or_edit(update, "\n".join(lines), kb(rows))
++
++
++async def cb_audit_csv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
++    """Выгрузить весь аудит роутера в CSV-файл."""
++    q = update.callback_query
++    _, _, rid = q.data.split(":")
++    u = update.effective_user
++    if not u or not is_admin(ctx, u.id):
++        await q.answer("Только админ", show_alert=True)
++        return
++    db: DB = ctx.application.bot_data["db"]
++    rows = db.audit_all_by_router(rid)
++    import csv as _csv
++    buf = io.StringIO()
++    w = _csv.writer(buf)
++    w.writerow(["at", "tg_id", "username", "action", "args", "result"])
++    for a in rows:
++        try:
++            w.writerow([
++                a["at"], a["tg_id"], a["username"] or "",
++                a["action"], a["args"] or "", a["result"] or "",
++            ])
++        except (IndexError, KeyError):
++            continue
++    data = buf.getvalue().encode("utf-8")
++    await q.answer("Готовлю CSV…")
++    await q.message.reply_document(
++        document=InputFile(io.BytesIO(data), filename=f"audit_{rid}.csv"),
++        caption=f"📜 Аудит {rid} — {len(rows)} записей",
++    )
++
++
++# =============================================================================
++# Stage 3 / A8: Глобальный тест — новый формат
++# =============================================================================
++# Запускаемый только online роутеры, параллелизм 5, на каждый 30 сек.
++# Результат — файл .log с блоками на роутер + summary.
++
++GLOBAL_TEST_MAX_WORKERS = 5
++GLOBAL_TEST_ROUTER_TIMEOUT = 30
++
++
++async def cb_global_test(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
++    """Глобальный тест v2 — только админ."""
++    u = update.effective_user
++    if not u or not is_admin(ctx, u.id):
++        await reply_or_edit(update, "Только админ.",
++                            kb([[btn("← Главная", "menu:main")]]))
++        return
++    db: DB = ctx.application.bot_data["db"]
++    cfg: dict = ctx.application.bot_data["cfg"]
++    rcfg: dict = ctx.application.bot_data["r_config"]
++    log = ctx.application.bot_data["log"]
++
++    routers = discover(rcfg)
++    # Только online, не lifecycle-изменённые.
++    states = {s["router_id"]: s for s in db.all_states()}
++
++    def _is_target(r: Router) -> bool:
++        st = states.get(r.id)
++        if st is None:
++            return False
++        try:
++            lc = st["lifecycle_status"]
++        except (IndexError, KeyError):
++            lc = None
++        if lc in ("transit", "maintenance"):
++            return False
++        try:
++            return bool(st["online"])
++        except (IndexError, KeyError):
++            return False
++
++    targets = [r for r in routers if _is_target(r)]
++    if not targets:
++        await reply_or_edit(update, "Нет online-роутеров для теста.",
++                            kb([[btn("← назад", "menu:main")]]))
++        return
++
++    await reply_or_edit(
++        update,
++        f"🧪 Глобальный тест — запускаю на {len(targets)} роутерах "
++        f"(параллельно до {GLOBAL_TEST_MAX_WORKERS}, таймаут "
++        f"{GLOBAL_TEST_ROUTER_TIMEOUT}s каждому)…",
++    )
++
++    loop = asyncio.get_event_loop()
++
++    def _run(r: Router):
++        try:
++            return do_router_selftest(r, rcfg["ssh"])
++        except Exception as e:
++            return ("FAIL", [f"[FAIL] exception: {e}"], str(e))
++
++    sem = asyncio.Semaphore(GLOBAL_TEST_MAX_WORKERS)
++
++    async def _task(r: Router):
++        async with sem:
++            try:
++                return r, await asyncio.wait_for(
++                    loop.run_in_executor(None, _run, r),
++                    timeout=GLOBAL_TEST_ROUTER_TIMEOUT + 5,
++                )
++            except asyncio.TimeoutError:
++                return r, ("FAIL", ["[FAIL] timeout"], "timeout")
++            except Exception as e:
++                return r, ("FAIL", [f"[FAIL] exception: {e}"], str(e))
++
++    results = await asyncio.gather(*[_task(r) for r in targets])
++
++    # Собираем файл
++    ts = dt.datetime.utcnow().strftime("%Y-%m-%d_%H-%M")
++    out_lines: list[str] = []
++    pass_n = warn_n = fail_n = 0
++    overrides = rcfg.get("overrides") or {}
++    for r, (verdict, lines, raw) in results:
++        st = states.get(r.id)
++        owner = ""
++        try:
++            label = st["label"] or ""
++        except (IndexError, KeyError):
++            label = ""
++        label = label or overrides.get(r.id, "")
++        country_iso = ""
++        try:
++            country_iso = st["egress_country_iso"] or ""
++        except (IndexError, KeyError):
++            pass
++        header_extras = []
++        if label:
++            header_extras.append(f"label: {label}")
++        if country_iso:
++            header_extras.append(country_iso)
++        extras = "  ·  ".join(header_extras)
++        out_lines.append("=" * 60)
++        out_lines.append(f"{r.id}" + (f"  ·  {extras}" if extras else ""))
++        out_lines.append("=" * 60)
++        out_lines.extend(lines)
++        out_lines.append(f"RESULT: {'✅ PASS' if verdict == 'PASS' else '⚠ WARN' if verdict == 'WARN' else '❌ FAIL'}")
++        out_lines.append("")
++        if verdict == "PASS":
++            pass_n += 1
++        elif verdict == "WARN":
++            warn_n += 1
++        else:
++            fail_n += 1
++    out_lines.append("=" * 60)
++    out_lines.append(f"SUMMARY  ({ts})")
++    out_lines.append("=" * 60)
++    out_lines.append(f"Total tested: {len(targets)}")
++    out_lines.append(f"✅ PASS: {pass_n}")
++    out_lines.append(f"⚠ WARN: {warn_n}")
++    out_lines.append(f"❌ FAIL: {fail_n}")
++    body = "\n".join(out_lines) + "\n"
++    runs_dir = Path(cfg["paths"]["runs"]) / "global"
++    runs_dir.mkdir(parents=True, exist_ok=True)
++    fpath = runs_dir / f"global_test_{ts}.log"
++    fpath.write_text(body, encoding="utf-8")
++    db.audit(u.id, u.username, None, "global_test",
++             f"total={len(targets)} pass={pass_n} warn={warn_n} fail={fail_n}",
++             "ok")
++    log.info("global test done: pass=%d warn=%d fail=%d", pass_n, warn_n, fail_n)
++
++    summary = (
++        f"🧪 <b>Глобальный тест завершён</b>\n"
++        f"Протестировано: {len(targets)}/{len(targets)} online-роутеров\n"
++        f"✅ {pass_n}  ⚠ {warn_n}  ❌ {fail_n}"
++    )
++    q = update.callback_query
++    chat = update.effective_chat
++    chat_id = chat.id if chat else (q.message.chat_id if q else None)
++    if chat_id is None:
++        return
++    with open(fpath, "rb") as fh:
++        await ctx.bot.send_document(
++            chat_id,
++            document=InputFile(fh, filename=fpath.name),
++            caption=summary,
++            parse_mode=ParseMode.HTML,
++            reply_markup=kb([[btn("← Главная", "menu:main")]]),
++        )
++
++
++# =============================================================================
+ # Admin: VLESS пул
+ # =============================================================================
+ 
+@@ -2272,8 +3342,15 @@
+         return
+     cfg: dict = ctx.application.bot_data["cfg"]
+     dig = cfg["digest"]
++    db: DB = ctx.application.bot_data["db"]
++    try:
++        unread_logs = db.client_logs_unread_count()
++    except Exception:
++        unread_logs = 0
++    clog_label = f"📥 Логи от клиентов ({unread_logs})" if unread_logs else "📥 Логи от клиентов"
+     rows = [
+         [btn("📜 Журнал (audit)", "cfg:audit:0")],
++        [btn(clog_label, "clog:list:0")],
+         [btn("💾 Бэкап сейчас", "cfg:backup")],
+         [btn("🔄 Обновить из Git", "cfg:update")],
+         [btn("📊 Тест digest", "cfg:digest_test")],
+@@ -2702,6 +3779,126 @@
+             await msg.reply_text(f"❌ {esc(e)}")
+         return
+ 
++    # --- Stage 3 / Клиент пкт 8: routing add ---
++    if state == "awaiting_routing_add":
++        rid = ctx.user_data.get("state_rid")
++        if not rid:
++            ctx.user_data.pop("state", None)
++            return
++        if not client_owns_router(ctx, u.id, rid):
++            ctx.user_data.pop("state", None)
++            ctx.user_data.pop("state_rid", None)
++            return
++        # Парсим список: один на строку, lowercase.
++        raw_lines = [ln.strip().lower() for ln in text.splitlines() if ln.strip()]
++        if not raw_lines:
++            await msg.reply_text(
++                "❌ Ничего не понял. Пришли домены по одному на строку.",
++                reply_markup=kb([[btn("← назад", f"rt:menu:{rid}")]]),
++            )
++            return
++
++        # Валидация
++        bad: list[str] = []
++        good: list[str] = []
++        for d in raw_lines:
++            # strip schemes/trailing slashes для дружелюбия
++            d = re.sub(r"^(?:https?://)?(?:www\.)?", "", d)
++            d = d.split("/")[0].split("?")[0].split(":")[0].strip()
++            ok_dom, err = validate_domain(d)
++            if ok_dom:
++                if d not in good:
++                    good.append(d)
++            else:
++                bad.append(f"{d}: {err}")
++        if bad and not good:
++            await msg.reply_text(
++                "❌ Ни одного валидного домена:\n" +
++                "\n".join(f"• <code>{esc(x)}</code>" for x in bad[:10]),
++                parse_mode=ParseMode.HTML,
++                reply_markup=kb([[btn("← назад", f"rt:menu:{rid}")]]),
++            )
++            ctx.user_data.pop("state", None)
++            ctx.user_data.pop("state_rid", None)
++            return
++
++        # Получаем текущее состояние, сливаем added
++        ok, server, added, removed, err = await _rt_current_state(db, rid, ctx, u.id)
++        if not ok:
++            await msg.reply_text(f"❌ {esc(err)}")
++            ctx.user_data.pop("state", None)
++            ctx.user_data.pop("state_rid", None)
++            return
++        existing = {x.lower() for x in server}
++        in_added = {x.lower() for x in added}
++        in_removed = {x.lower() for x in removed}
++        really_new: list[str] = []
++        dup: list[str] = []
++        for d in good:
++            dl = d.lower()
++            if dl in in_added:
++                dup.append(d)
++                continue
++            if dl in existing and dl not in in_removed:
++                dup.append(d)
++                continue
++            if dl in in_removed:
++                # Был отмечен на удаление — просто отменяем удаление.
++                removed = [r for r in removed if r.lower() != dl]
++            else:
++                added.append(d)
++                really_new.append(d)
++
++        # Rate-limit клиенту: только за действительно новые.
++        role = user_role(ctx, u.id)
++        if role != "admin" and really_new:
++            limit = cfg["rate_limits"].get("routing_add_per_day", 20)
++            if limit > 0:
++                allowed: list[str] = []
++                rejected = 0
++                for d in really_new:
++                    if db.rate_check_and_inc(u.id, "routing_add", limit):
++                        allowed.append(d)
++                    else:
++                        rejected += 1
++                if rejected:
++                    # Откатываем: убираем последние rejected из added.
++                    keep_lowers = {a.lower() for a in allowed}
++                    added = [
++                        a for a in added
++                        if a.lower() not in {x.lower() for x in really_new}
++                        or a.lower() in keep_lowers
++                    ]
++                    really_new = allowed
++                    await msg.reply_text(
++                        f"⚠ Лимит {limit}/день на добавления исчерпан. "
++                        f"Добавлено {len(allowed)} из {len(allowed) + rejected}."
++                    )
++        db.pending_routing_save(u.id, rid, added, removed)
++
++        ctx.user_data.pop("state", None)
++        ctx.user_data.pop("state_rid", None)
++
++        report_lines = [
++            f"📋 <b>{rid}</b> — правки приняты",
++            f"Новых в буфере: <b>{len(really_new)}</b>",
++        ]
++        if dup:
++            report_lines.append(f"Уже было: {len(dup)}")
++        if bad:
++            report_lines.append(f"Отклонено невалидных: {len(bad)}")
++        report_lines.append("")
++        report_lines.append("Открой «📋 Маршрутизация» для применения.")
++        await msg.reply_text(
++            "\n".join(report_lines),
++            parse_mode=ParseMode.HTML,
++            reply_markup=kb([
++                [btn("📋 К меню маршрутизации", f"rt:menu:{rid}")],
++                [btn("← к роутеру", f"r:{rid}")],
++            ]),
++        )
++        return
++
+     # --- по умолчанию ---
+     await cmd_start(update, ctx)
+ 
+@@ -2912,6 +4109,45 @@
+             pass
+ 
+ 
++async def job_audit_retention(ctx: ContextTypes.DEFAULT_TYPE):
++    """Stage 3 / A7: дропаем audit старше cfg.audit_retention_days."""
++    cfg: dict = ctx.application.bot_data["cfg"]
++    db: DB = ctx.application.bot_data["db"]
++    log = ctx.application.bot_data["log"]
++    days = int(cfg.get("audit_retention_days", 90))
++    try:
++        deleted = db.audit_retention_cleanup(days=days)
++        log.info("audit retention: dropped %d rows (>%d days)", deleted, days)
++    except Exception:
++        log.exception("audit retention")
++
++
++async def job_client_logs_retention(ctx: ContextTypes.DEFAULT_TYPE):
++    """Stage 3 / S3-4: дропаем клиентские логи + файлы старше
++    cfg.client_logs_retention_days (30 по умолчанию)."""
++    cfg: dict = ctx.application.bot_data["cfg"]
++    db: DB = ctx.application.bot_data["db"]
++    log = ctx.application.bot_data["log"]
++    days = int(cfg.get("client_logs_retention_days", 30))
++    try:
++        paths = db.client_logs_retention_cleanup(days=days)
++    except Exception:
++        log.exception("client logs retention (db)")
++        return
++    removed = 0
++    for p in paths:
++        try:
++            if p:
++                fp = Path(p)
++                if fp.exists():
++                    fp.unlink()
++                    removed += 1
++        except Exception:
++            log.exception("unlink %s", p)
++    log.info("client logs retention: db=%d files=%d (>%d days)",
++             len(paths), removed, days)
++
++
+ async def job_auto_update(ctx: ContextTypes.DEFAULT_TYPE):
+     cfg: dict = ctx.application.bot_data["cfg"]
+     if not cfg["auto_update"]["enabled"]:
+@@ -3102,6 +4338,60 @@
+             await cb_guest_request(update, ctx)
+             return
+ 
++        # Stage 3 / Client пкт 8: маршрутизация
++        if data.startswith("rt:menu:"):
++            await cb_rt_menu(update, ctx)
++            return
++        if data.startswith("rt:add:"):
++            await cb_rt_add_start(update, ctx)
++            return
++        if data.startswith("rt:rmlist:"):
++            await cb_rt_remove_list(update, ctx)
++            return
++        if data.startswith("rt:rmone:") or data.startswith("rt:rmoneI:"):
++            await cb_rt_rmone(update, ctx)
++            return
++        if data.startswith("rt:reset:"):
++            await cb_rt_reset(update, ctx)
++            return
++        if data.startswith("rt:preview:"):
++            await cb_rt_preview(update, ctx)
++            return
++        if data.startswith("rt:apply:"):
++            await cb_rt_apply(update, ctx)
++            return
++        # Stage 3 / Client пкт 2: отправить лог админу
++        if data.startswith("lga:"):
++            await cb_log_to_admin(update, ctx)
++            return
++        if data.startswith("clog:read:"):
++            await cb_clog_read(update, ctx)
++            return
++        if data.startswith("clog:view:"):
++            await cb_client_log_view(update, ctx)
++            return
++        if data.startswith("clog:file:"):
++            await cb_client_log_file(update, ctx)
++            return
++        if data.startswith("clog:list"):
++            await cb_client_logs_list(update, ctx)
++            return
++        # Stage 3 / A7: audit UI
++        if data.startswith("aud:r:"):
++            await cb_audit_router(update, ctx)
++            return
++        if data.startswith("aud:csv:"):
++            await cb_audit_csv(update, ctx)
++            return
++        # Stage 3 / A8: глобальный тест
++        if data == "gt:run":
++            await cb_global_test(update, ctx)
++            return
++        # noop — заглушка для счётчиков страниц
++        if data == "noop":
++            await q.answer()
++            return
++
+         await q.answer("Неизвестная команда", show_alert=False)
+     except Exception as e:
+         log = ctx.application.bot_data.get("log")
+@@ -3274,6 +4564,12 @@
+     # Cleanup старых run-логов
+     jq.run_daily(job_cleanup_runs, time=dt.time(2, 30, tzinfo=tz))
+ 
++    # Stage 3 / A7: retention для audit (по умолчанию 90 дней)
++    jq.run_daily(job_audit_retention, time=dt.time(4, 0, tzinfo=tz))
++
++    # Stage 3 / S3-4: retention клиентских логов (по умолчанию 30 дней)
++    jq.run_daily(job_client_logs_retention, time=dt.time(4, 15, tzinfo=tz))
++
+     # Auto-update (если вкл)
+     if cfg["auto_update"]["enabled"]:
+         dt_au = _parse_hhmm(cfg["auto_update"]["time"]).replace(tzinfo=tz)
+diff -urN stage2/bot/router.py stage3/bot/router.py
+--- stage2/bot/router.py	2026-04-24 14:55:53.085000414 +0300
++++ stage3/bot/router.py	2026-04-24 14:56:00.743000418 +0300
+@@ -761,6 +761,296 @@
+ 
+ 
+ # =============================================================================
++# Stage 3 / Клиент пкт 8: Custom routing (list user_domains)
++# =============================================================================
++#
++# Подкоп хранит список доменов в uci ключе `podkop.main.user_domains` (add_list).
++# Переключатель `user_domain_list_type` определяет, активен ли список:
++#   - 'dynamic' — список используется
++#   - 'disabled' — игнорируется (пустой список)
++#
++# Наш UI:
++#   - читаем текущий список через `uci -q get podkop.main.user_domains`
++#     (возвращается одна строка со всеми элементами через пробел, если uci list)
++#   - показываем клиенту, он правит в буфере (таблица pending_routing)
++#   - при Apply: del_list, add_list, auto user_domain_list_type, commit, restart
++
++_DOMAIN_RE = re.compile(
++    r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$"
++)
++
++
++def validate_domain(d: str) -> tuple[bool, str]:
++    """True / (False, reason). Строгая валидация по spec пкт 8."""
++    if not d:
++        return False, "пусто"
++    if len(d) > 253:
++        return False, "слишком длинный (>253)"
++    if not _DOMAIN_RE.match(d):
++        return False, "не похож на домен"
++    return True, ""
++
++
++def do_get_routing(r: Router, ssh_cfg: dict) -> tuple[bool, list[str], str]:
++    """Читает podkop.main.user_domains. Возвращает (ok, list, error_msg).
++    Порядок доменов сохраняется как в uci (добавление в конец)."""
++    # uci show podkop | grep user_domains — даёт все add_list элементы по одной
++    # строке:   podkop.main.user_domains='example.com'
++    script = (
++        "uci -q show podkop.main.user_domains 2>/dev/null || true\n"
++        "uci -q get podkop.main.user_domain_list_type 2>/dev/null || echo __NONE__\n"
++    )
++    try:
++        with SSH(
++            ssh_cfg.get("host", "127.0.0.1"),
++            r.ssh_port,
++            ssh_cfg.get("user", "root"),
++            ssh_cfg["password"],
++            ssh_cfg.get("connect_timeout", 8),
++        ) as s:
++            rc, out, err = s.run(script, timeout=15)
++    except SSHError as e:
++        return False, [], str(e)
++    domains: list[str] = []
++    for ln in (out or "").splitlines():
++        ln = ln.strip()
++        if not ln:
++            continue
++        # podkop.main.user_domains='example.com' или podkop.main.user_domains=example.com
++        m = re.match(r"^podkop\.main\.user_domains=['\"]?([^'\"]+)['\"]?\s*$", ln)
++        if m:
++            val = m.group(1).strip()
++            if val:
++                domains.append(val)
++    return True, domains, ""
++
++
++def do_set_routing(
++    r: Router,
++    ssh_cfg: dict,
++    to_add: list[str],
++    to_remove: list[str],
++) -> tuple[bool, str]:
++    """Применить diff: del_list removed + add_list added, переключить
++    user_domain_list_type по итоговому размеру, commit + podkop restart.
++
++    Возвращает (ok, message). to_add/to_remove должны быть провалидированы
++    снаружи (validate_domain)."""
++    # Защита от инъекций: все значения прогоняем через validate + shlex.quote.
++    for d in to_add + to_remove:
++        ok, why = validate_domain(d)
++        if not ok:
++            return False, f"invalid domain '{d}': {why}"
++
++    lines: list[str] = []
++    # Удаления
++    for d in to_remove:
++        lines.append(f"uci del_list podkop.main.user_domains={shlex.quote(d)} 2>/dev/null || true")
++    # Добавления
++    for d in to_add:
++        lines.append(f"uci add_list podkop.main.user_domains={shlex.quote(d)}")
++    # Итоговый размер и переключатель user_domain_list_type
++    lines.append(
++        "REMAINING=$(uci -q get podkop.main.user_domains 2>/dev/null | wc -w)"
++    )
++    lines.append('if [ "$REMAINING" -gt 0 ]; then')
++    lines.append("  uci set podkop.main.user_domain_list_type='dynamic'")
++    lines.append("else")
++    lines.append("  uci set podkop.main.user_domain_list_type='disabled'")
++    lines.append("fi")
++    lines.append("uci commit podkop")
++    lines.append("/etc/init.d/podkop restart 2>&1 || true")
++    lines.append('echo "(routing applied)"')
++    script = "\n".join(lines)
++    try:
++        with SSH(
++            ssh_cfg.get("host", "127.0.0.1"),
++            r.ssh_port,
++            ssh_cfg.get("user", "root"),
++            ssh_cfg["password"],
++            ssh_cfg.get("connect_timeout", 8),
++        ) as s:
++            rc, out, err = s.run(script, timeout=45)
++        if rc != 0:
++            return False, (err or out).strip() or f"exit={rc}"
++        return True, (out or "ok").strip()
++    except SSHError as e:
++        return False, str(e)
++
++
++# =============================================================================
++# Stage 3 / Клиент пкт 2: capture log-дамп для отправки админу.
++# =============================================================================
++
++def do_capture_client_log(r: Router, ssh_cfg: dict,
++                          global_check_output: str = "") -> str:
++    """Собирает для клиентского «отправить лог админу»:
++       - переданный вывод global_check (если есть)
++       - последние 100 строк logread | grep -Ei 'podkop|xray|sing-box'
++       - снапшот uci show podkop (обрезан)
++
++    Возвращает текст (уже объединённый). Никогда не падает — даже если SSH
++    упал, вернёт сообщение об ошибке как часть лога."""
++    script = r"""
++echo "=== logread (tail 100 filtered) ==="
++logread 2>/dev/null | grep -Ei 'podkop|xray|sing-box' | tail -n 100
++echo ""
++echo "=== uci show podkop (head 50) ==="
++uci -q show podkop 2>/dev/null | head -n 50
++echo ""
++echo "=== pgrep sing-box ==="
++pgrep -fa "sing-box" 2>/dev/null || echo "(no sing-box)"
++echo ""
++echo "=== nft list tables ==="
++nft list tables 2>/dev/null | head -n 20
++"""
++    try:
++        with SSH(
++            ssh_cfg.get("host", "127.0.0.1"),
++            r.ssh_port,
++            ssh_cfg.get("user", "root"),
++            ssh_cfg["password"],
++            ssh_cfg.get("connect_timeout", 8),
++        ) as s:
++            rc, out, err = s.run(script, timeout=20)
++        body = out or ""
++        if err.strip():
++            body += "\n--- stderr ---\n" + err
++    except SSHError as e:
++        body = f"(SSH failed while capturing tail: {e})"
++
++    parts: list[str] = []
++    if global_check_output.strip():
++        parts.append("=== global_check output ===")
++        parts.append(global_check_output.strip())
++        parts.append("")
++    parts.append(body)
++    return "\n".join(parts).strip() + "\n"
++
++
++# =============================================================================
++# Stage 3 / A8: один per-router тест с PASS/WARN/FAIL вердиктом.
++# =============================================================================
++
++def do_router_selftest(r: Router, ssh_cfg: dict) -> tuple[str, list[str], str]:
++    """Запускает короткий набор проверок на роутере и возвращает
++    (verdict, lines, raw_output).
++
++    verdict ∈ {'PASS', 'WARN', 'FAIL'}.
++
++    Проверки (все в одном SSH-вызове):
++      1. sing-box процесс
++      2. PodkopTable в nftables
++      3. local_ip (yandex.ru)
++      4. egress_ip (ifconfig.co)
++      5. egress ≠ local (трафик реально идёт через VLESS)
++      6. DNS resolve youtube.com
++      7. HTTP curl youtube.com
++
++    FAIL: 1 или 2 упали (подкоп не работает).
++    WARN: 5, 6 или 7 упали (подкоп жив, но трафик странный).
++    PASS: всё ок."""
++    script = r"""
++SING=$(pgrep -f "^/usr/bin/sing-box" >/dev/null 2>&1 && echo 1 || echo 0)
++TABLE=$(nft list tables 2>/dev/null | grep -q "PodkopTable" && echo 1 || echo 0)
++LOCAL_IP=$(wget -qT5 -O- 'https://yandex.ru/internet/api/v0/ip/' 2>/dev/null | tr -d '"\n' || echo "")
++EGRESS=$(wget -qT5 -O- 'https://ifconfig.co/json' 2>/dev/null || echo "")
++DNS_YT=$(nslookup youtube.com 2>/dev/null | awk '/^Address/{a=$3} END{print a}')
++HTTP_YT=$(wget --spider -qT10 https://youtube.com 2>&1 && echo 200 || echo fail)
++echo "SING=$SING"
++echo "TABLE=$TABLE"
++echo "LOCAL_IP=$LOCAL_IP"
++echo "EGRESS=$EGRESS"
++echo "DNS_YT=$DNS_YT"
++echo "HTTP_YT=$HTTP_YT"
++"""
++    try:
++        with SSH(
++            ssh_cfg.get("host", "127.0.0.1"),
++            r.ssh_port,
++            ssh_cfg.get("user", "root"),
++            ssh_cfg["password"],
++            ssh_cfg.get("connect_timeout", 8),
++        ) as s:
++            rc, out, err = s.run(script, timeout=30)
++    except SSHError as e:
++        return "FAIL", [f"[FAIL] SSH: {e}"], str(e)
++
++    # Парсинг
++    sing = False
++    table = False
++    local_ip = ""
++    egress_ip = ""
++    egress_country = ""
++    egress_city = ""
++    dns_yt = ""
++    http_yt = ""
++    for ln in (out or "").splitlines():
++        if ln.startswith("SING="):
++            sing = ln.endswith("=1")
++        elif ln.startswith("TABLE="):
++            table = ln.endswith("=1")
++        elif ln.startswith("LOCAL_IP="):
++            local_ip = ln[len("LOCAL_IP="):].strip()
++        elif ln.startswith("EGRESS="):
++            raw = ln[len("EGRESS="):].strip()
++            if raw:
++                try:
++                    j = json.loads(raw)
++                    egress_ip = (j.get("ip") or "").strip()
++                    egress_country = (j.get("country") or "").strip()
++                    egress_city = (j.get("city") or "").strip()
++                except Exception:
++                    pass
++        elif ln.startswith("DNS_YT="):
++            dns_yt = ln[len("DNS_YT="):].strip()
++        elif ln.startswith("HTTP_YT="):
++            http_yt = ln[len("HTTP_YT="):].strip()
++
++    lines: list[str] = []
++    # 1, 2
++    lines.append(f"[{'OK' if sing else 'FAIL'}] sing-box процесс {'жив' if sing else 'НЕ найден'}")
++    lines.append(f"[{'OK' if table else 'FAIL'}] PodkopTable в nftables {'найдена' if table else 'НЕ найдена'}")
++    # 3
++    lines.append(f"[{'OK' if local_ip else 'WARN'}] local_ip: {local_ip or '(не получен)'}")
++    # 4
++    if egress_ip:
++        extra = ""
++        if egress_country:
++            extra = f" ({egress_country}{(', ' + egress_city) if egress_city else ''})"
++        lines.append(f"[OK] egress_ip: {egress_ip}{extra}")
++    else:
++        lines.append("[WARN] egress_ip: (не получен)")
++    # 5: egress != local
++    if egress_ip and local_ip:
++        if egress_ip == local_ip:
++            lines.append(f"[WARN] egress == local → трафик идёт мимо VLESS")
++        else:
++            lines.append(f"[OK] egress != local → трафик через VLESS")
++    else:
++        lines.append("[WARN] не могу сравнить egress/local (нет данных)")
++    # 6: DNS
++    if dns_yt:
++        lines.append(f"[OK] DNS resolve youtube.com → {dns_yt}")
++    else:
++        lines.append("[WARN] DNS resolve youtube.com: нет ответа")
++    # 7: HTTP
++    if http_yt == "200":
++        lines.append("[OK] curl https://youtube.com → 200 OK")
++    else:
++        lines.append(f"[WARN] curl https://youtube.com → {http_yt or 'нет ответа'}")
++
++    # Вердикт
++    verdict = "PASS"
++    if not sing or not table:
++        verdict = "FAIL"
++    elif any(ln.startswith("[WARN]") for ln in lines):
++        verdict = "WARN"
++
++    return verdict, lines, out or ""
++
++
++# =============================================================================
+ # YAML-редактор ярлыков (синхронизирован с r.py)
+ # =============================================================================
+ 

@@ -1,0 +1,571 @@
+diff --git a/bot/db.py b/bot/db.py
+index 4aa9b2e..bd22bd2 100644
+--- a/bot/db.py
++++ b/bot/db.py
+@@ -91,7 +91,20 @@ CREATE TABLE IF NOT EXISTS router_state (
+     active_vless     TEXT,
+     last_poll_at     TEXT,
+     last_online_at   TEXT,
+-    last_offline_at  TEXT
++    last_offline_at  TEXT,
++    -- Stage 1 / Пункт 1+3+A5 additions:
++    sing_running        INTEGER,   -- 0/1, pgrep sing-box
++    nft_table           INTEGER,   -- 0/1, PodkopTable в nftables
++    local_ip            TEXT,      -- IP от провайдера (yandex.ru/internet)
++    egress_ip           TEXT,      -- IP на выходе из VLESS (ifconfig.co)
++    egress_country      TEXT,      -- 'Germany'
++    egress_country_iso  TEXT,      -- 'DE'
++    egress_city         TEXT,
++    egress_asn_org      TEXT,
++    hw_model            TEXT,      -- 'Xiaomi Redmi AC2100'
++    openwrt_version     TEXT,
++    podkop_version      TEXT,
++    singbox_version     TEXT
+ );
+ 
+ CREATE TABLE IF NOT EXISTS router_state_history (
+@@ -146,6 +159,35 @@ class DB:
+         self._conn.execute("PRAGMA journal_mode=WAL")
+         self._conn.execute("PRAGMA foreign_keys=ON")
+         self._conn.executescript(SCHEMA)
++        self._migrate()
++
++    # =========================================================================
++    # Stage 1 migration — добавляем колонки в router_state на существующих БД.
++    # SQLite ALTER TABLE ADD COLUMN идемпотентен только если колонки нет —
++    # проверяем PRAGMA table_info перед каждым ALTER.
++    # =========================================================================
++    def _migrate(self) -> None:
++        cur = self._conn.execute("PRAGMA table_info(router_state)")
++        existing = {row[1] for row in cur.fetchall()}
++        new_cols = [
++            ("sing_running",       "INTEGER"),
++            ("nft_table",          "INTEGER"),
++            ("local_ip",           "TEXT"),
++            ("egress_ip",          "TEXT"),
++            ("egress_country",     "TEXT"),
++            ("egress_country_iso", "TEXT"),
++            ("egress_city",        "TEXT"),
++            ("egress_asn_org",     "TEXT"),
++            ("hw_model",           "TEXT"),
++            ("openwrt_version",    "TEXT"),
++            ("podkop_version",     "TEXT"),
++            ("singbox_version",    "TEXT"),
++        ]
++        for name, decl in new_cols:
++            if name not in existing:
++                self._conn.execute(
++                    f"ALTER TABLE router_state ADD COLUMN {name} {decl}"
++                )
+ 
+     # --- низкоуровневое ---
+     @contextmanager
+@@ -358,19 +400,40 @@ class DB:
+         uptime: str | None,
+         wan_ip: str | None,
+         active_vless: str | None,
++        # Stage 1 additions: дефолты None, чтобы старые вызовы не сломались.
++        sing_running: bool | None = None,
++        nft_table: bool | None = None,
++        local_ip: str | None = None,
++        egress_ip: str | None = None,
++        egress_country: str | None = None,
++        egress_country_iso: str | None = None,
++        egress_city: str | None = None,
++        egress_asn_org: str | None = None,
++        hw_model: str | None = None,
++        openwrt_version: str | None = None,
++        podkop_version: str | None = None,
++        singbox_version: str | None = None,
+     ):
+         prev = self.q1(
+             "SELECT online, podkop_status, active_vless FROM router_state WHERE router_id=?",
+             (router_id,),
+         )
+         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
++        # Преобразуем bool|None → int|None для SQLite.
++        sing_int = None if sing_running is None else int(bool(sing_running))
++        nft_int = None if nft_table is None else int(bool(nft_table))
+         self.ex(
+             """INSERT INTO router_state(router_id, label, online, podkop_status, uptime,
+                                         wan_ip, active_vless, last_poll_at,
+-                                        last_online_at, last_offline_at)
++                                        last_online_at, last_offline_at,
++                                        sing_running, nft_table, local_ip, egress_ip,
++                                        egress_country, egress_country_iso, egress_city,
++                                        egress_asn_org, hw_model, openwrt_version,
++                                        podkop_version, singbox_version)
+                VALUES (?,?,?,?,?,?,?,?,
+                        CASE WHEN ?=1 THEN ? ELSE NULL END,
+-                       CASE WHEN ?=0 THEN ? ELSE NULL END)
++                       CASE WHEN ?=0 THEN ? ELSE NULL END,
++                       ?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(router_id) DO UPDATE SET
+                  label=excluded.label,
+                  online=excluded.online,
+@@ -380,13 +443,32 @@ class DB:
+                  active_vless=excluded.active_vless,
+                  last_poll_at=excluded.last_poll_at,
+                  last_online_at=CASE WHEN ?=1 THEN ? ELSE router_state.last_online_at END,
+-                 last_offline_at=CASE WHEN ?=0 THEN ? ELSE router_state.last_offline_at END
++                 last_offline_at=CASE WHEN ?=0 THEN ? ELSE router_state.last_offline_at END,
++                 -- Stage 1 поля: для offline-ветки оставляем старые значения,
++                 -- для online — перезаписываем (даже если None — это корректно
++                 -- для случая когда внешний IP-проб не отработал).
++                 sing_running       = COALESCE(excluded.sing_running,       router_state.sing_running),
++                 nft_table          = COALESCE(excluded.nft_table,          router_state.nft_table),
++                 local_ip           = COALESCE(excluded.local_ip,           router_state.local_ip),
++                 egress_ip          = COALESCE(excluded.egress_ip,          router_state.egress_ip),
++                 egress_country     = COALESCE(excluded.egress_country,     router_state.egress_country),
++                 egress_country_iso = COALESCE(excluded.egress_country_iso, router_state.egress_country_iso),
++                 egress_city        = COALESCE(excluded.egress_city,        router_state.egress_city),
++                 egress_asn_org     = COALESCE(excluded.egress_asn_org,     router_state.egress_asn_org),
++                 hw_model           = COALESCE(excluded.hw_model,           router_state.hw_model),
++                 openwrt_version    = COALESCE(excluded.openwrt_version,    router_state.openwrt_version),
++                 podkop_version     = COALESCE(excluded.podkop_version,     router_state.podkop_version),
++                 singbox_version    = COALESCE(excluded.singbox_version,    router_state.singbox_version)
+             """,
+             (
+                 router_id, label, int(online), podkop_status, uptime,
+                 wan_ip, active_vless, now,
+                 int(online), now,
+                 int(online), now,
++                sing_int, nft_int, local_ip, egress_ip,
++                egress_country, egress_country_iso, egress_city,
++                egress_asn_org, hw_model, openwrt_version,
++                podkop_version, singbox_version,
+                 int(online), now,
+                 int(online), now,
+             ),
+diff --git a/bot/r_bot.py b/bot/r_bot.py
+index 990d448..bac9e96 100644
+--- a/bot/r_bot.py
++++ b/bot/r_bot.py
+@@ -147,8 +147,11 @@ def load_r_config(cfg: dict) -> dict:
+     if not ssh.get("password"):
+         raise SystemExit(f"В {path} не указан ssh.password")
+     rc.setdefault("overrides", {})
+-    rc.setdefault("web_port_range", [10001, 10099])
+-    rc.setdefault("ssh_port_range", [11001, 11099])
++    # Stage 1 / A4: max_routers=999. Расширили дефолтные диапазоны портов
++    # с 99 до 999. Существующие deployments с портами 10001-10099/11001-11099
++    # продолжают работать без изменений (id07 → 10007/11007).
++    rc.setdefault("web_port_range", [10001, 10999])
++    rc.setdefault("ssh_port_range", [11001, 11999])
+     return rc
+ 
+ 
+@@ -191,11 +194,42 @@ def status_icon(online: bool, podkop: str | None) -> str:
+         return "🔴"
+     if podkop == "RUN":
+         return "🟢"
+-    if podkop == "STOP":
++    # Stage 1: новый статус BYPASS — sing-box работает, но трафик идёт мимо
++    # VLESS (egress IP == local IP). Жёлтый предупреждающий.
++    if podkop == "BYPASS":
+         return "🟡"
++    if podkop == "STOP":
++        return "🟠"   # ярко-оранжевый: подкоп упал на онлайн-роутере
+     return "⚪"
+ 
+ 
++def _country_flag(iso: str) -> str:
++    """ISO 3166 alpha-2 ('DE') → 🇩🇪 (regional indicator pair). Возвращает
++    пустую строку, если код некорректный или пустой. Не делает доп.
++    запросов — чисто строковое преобразование."""
++    if not iso or len(iso) != 2 or not iso.isalpha():
++        return ""
++    iso = iso.upper()
++    base = 0x1F1E6  # regional indicator A
++    return chr(base + (ord(iso[0]) - ord("A"))) + chr(base + (ord(iso[1]) - ord("A")))
++
++
++def _short_vless(url: str) -> str:
++    """Stage 1 / Пункт 4: для клиента не показываем полный vless:// URL.
++    Возвращает host (без порта/UUID), пригодный к подстановке во флаг+домен.
++    Если парсинг не удался — пустая строка."""
++    if not url:
++        return ""
++    try:
++        # parse_vless импортируется ниже; используем локальный мини-парсер
++        # чтобы избежать циклического импорта при загрузке модуля.
++        from urllib.parse import urlparse
++        p = urlparse(url.replace("vless://", "http://", 1))
++        return p.hostname or ""
++    except Exception:
++        return ""
++
++
+ def is_admin(ctx: ContextTypes.DEFAULT_TYPE, tg_id: int) -> bool:
+     cfg: dict = ctx.application.bot_data["cfg"]
+     if tg_id in cfg.get("admins", []):
+@@ -280,9 +314,14 @@ def kb_welcome_guest() -> InlineKeyboardMarkup:
+ 
+ 
+ def kb_router_menu(rid: str, role: str) -> InlineKeyboardMarkup:
++    # Stage 1 / Пункты 5, 6: переименованы кнопки.
++    #   "🔧 Restart podkop"  → "🔄 Перезагрузить службу"
++    #   "🔁 Reboot"          → "♻️ Перезагрузить Роутер (рекомендуется)"
++    # Кнопка ребута роутера теперь занимает отдельную строку (длинный текст).
+     rows = [
+         [btn("🔄 Статус", f"r:{rid}"), btn("▶️ Проверить", f"act:{rid}:check")],
+-        [btn("🔧 Restart podkop", f"act:{rid}:pres"), btn("🔁 Reboot", f"act:{rid}:boot")],
++        [btn("🔄 Перезагрузить службу", f"act:{rid}:pres")],
++        [btn("♻️ Перезагрузить Роутер (рекомендуется)", f"act:{rid}:boot")],
+         [btn("🔗 Сменить VLESS", f"vless:pick:{rid}:0")],
+     ]
+     if role == "admin":
+@@ -500,20 +539,77 @@ async def _show_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE, rid: str)
+     role = user_role(ctx, u.id)
+ 
+     if st:
++        is_admin = (role == "admin")
+         icon = status_icon(bool(st["online"]), st["podkop_status"])
+         status = "online" if st["online"] else "offline"
+         podkop = st["podkop_status"] or "—"
+         up = st["uptime"] or "—"
+-        wan = st["wan_ip"] or "—"
++        wan = st["wan_ip"] or ""
+         last = st["last_poll_at"] or "—"
+-        text = (
+-            f"<b>{rid}</b> — {esc(label)}\n"
+-            f"{icon} {status}\n"
+-            f"podkop: <b>{esc(podkop)}</b>\n"
+-            f"uptime: {esc(up)}\n"
+-            f"WAN: <code>{esc(wan)}</code>\n"
+-            f"последний опрос: {esc(last)}"
+-        )
++
++        # Stage 1 / Пункты 1, 3, 4: достаём новые поля. На старых записях
++        # колонки уже добавлены миграцией, но значения могут быть NULL.
++        # Безопасное чтение: KeyError/IndexError → пустая строка.
++        def _g(col: str) -> str:
++            try:
++                v = st[col]
++            except (IndexError, KeyError):
++                return ""
++            return v if v else ""
++
++        local_ip = _g("local_ip")
++        egress_ip = _g("egress_ip")
++        egress_country_iso = _g("egress_country_iso")
++        egress_city = _g("egress_city")
++        egress_asn_org = _g("egress_asn_org")
++        active_vless = _g("active_vless")
++        hw_model = _g("hw_model")
++        openwrt_version = _g("openwrt_version")
++        podkop_version = _g("podkop_version")
++        singbox_version = _g("singbox_version")
++        flag = _country_flag(egress_country_iso)
++
++        lines = [
++            f"<b>{rid}</b> — {esc(label)}",
++            f"{icon} {status}",
++            f"podkop: <b>{esc(podkop)}</b>",
++            f"uptime: {esc(up)}",
++        ]
++        # Пункт 3: показываем «локальный IP» (yandex), если есть, иначе старый
++        # WAN от OpenWrt. Они могут отличаться на 4G CGNAT.
++        if local_ip:
++            lines.append(f"локальный IP: <code>{esc(local_ip)}</code>")
++        elif wan:
++            lines.append(f"WAN: <code>{esc(wan)}</code>")
++        # Пункт 1: выходной IP с флагом, городом, ASN.
++        if egress_ip:
++            extras = [x for x in (egress_city, egress_asn_org) if x]
++            extra = (" · " + esc(" · ".join(extras))) if extras else ""
++            flag_part = (flag + " ") if flag else ""
++            lines.append(f"выход: {flag_part}<code>{esc(egress_ip)}</code>{extra}")
++        # Пункт 4: VLESS — клиенту только host, админу полный URL.
++        if active_vless:
++            if is_admin:
++                lines.append(f"VLESS: <code>{esc(active_vless)}</code>")
++            else:
++                short = _short_vless(active_vless)
++                if short:
++                    lines.append(f"VLESS: <code>{esc(short)}</code>")
++        # Пункт 1 (часть admin): версионный блок только для админа.
++        if is_admin:
++            ver_bits = []
++            if hw_model:
++                ver_bits.append(f"модель: {esc(hw_model)}")
++            if openwrt_version:
++                ver_bits.append(f"OpenWrt: {esc(openwrt_version)}")
++            if podkop_version:
++                ver_bits.append(f"podkop: {esc(podkop_version)}")
++            if singbox_version:
++                ver_bits.append(f"sing-box: {esc(singbox_version)}")
++            if ver_bits:
++                lines.append("<i>" + "  ·  ".join(ver_bits) + "</i>")
++        lines.append(f"последний опрос: {esc(last)}")
++        text = "\n".join(lines)
+     else:
+         text = (
+             f"<b>{rid}</b> — {esc(label)}\n"
+@@ -527,9 +623,12 @@ async def _show_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE, rid: str)
+ # Действия на роутере: confirm + execute
+ # =============================================================================
+ 
++# Stage 1 / Пункты 5, 6: метки приведены к новым русским названиям кнопок.
++# Первый элемент кортежа — короткая метка для audit-лога; второй — текст для
++# подтверждения "Точно ...?".
+ ACTION_LABELS = {
+-    "boot": ("Reboot", "перезагрузить роутер", "reboot_per_day"),
+-    "pres": ("Restart podkop", "перезапустить podkop", "podkop_restart_per_day"),
++    "boot": ("Перезагрузить Роутер", "перезагрузить роутер", "reboot_per_day"),
++    "pres": ("Перезагрузить службу", "перезагрузить службу podkop", "podkop_restart_per_day"),
+     "check": ("Global check", "запустить global_check", "global_check_per_day"),
+     "info": ("Info", "показать info", None),
+     "logs": ("Logread", "показать logread", None),
+@@ -1731,6 +1830,8 @@ async def _do_poll(app: Application):
+             res = results.get(rid)
+             if res is None:
+                 continue
++            # Stage 1: пробрасываем все новые поля PollResult в БД, чтобы
++            # _show_router и сводки могли их показывать сразу после полла.
+             db.update_state(
+                 rid,
+                 label,
+@@ -1739,8 +1840,22 @@ async def _do_poll(app: Application):
+                 uptime=res.uptime,
+                 wan_ip=res.wan_ip,
+                 active_vless=res.vless,
++                sing_running=res.sing_running,
++                nft_table=res.nft_table,
++                local_ip=res.local_ip,
++                egress_ip=res.egress_ip,
++                egress_country=res.egress_country,
++                egress_country_iso=res.egress_country_iso,
++                egress_city=res.egress_city,
++                egress_asn_org=res.egress_asn_org,
++                hw_model=res.hw_model,
++                openwrt_version=res.openwrt_version,
++                podkop_version=res.podkop_version,
++                singbox_version=res.singbox_version,
+             )
+         else:
++            # Offline: новые поля не трогаем — COALESCE в UPSERT сохранит
++            # последние известные значения (страна/модель не обнуляются).
+             db.update_state(rid, label, False, None, None, None, None)
+     log.info("poll: %d routers, %d online", len(known), len(online_ids))
+ 
+diff --git a/bot/router.py b/bot/router.py
+index 89abf94..3202b79 100644
+--- a/bot/router.py
++++ b/bot/router.py
+@@ -11,6 +11,7 @@ router.py — всё про взаимодействие с роутерами O
+ """
+ from __future__ import annotations
+ 
++import json
+ import re
+ import shlex
+ import socket
+@@ -61,6 +62,13 @@ def _parse_listening_ports() -> set[int]:
+     return ports
+ 
+ 
++def _format_router_id(num: int) -> str:
++    """Variable-length: id01..id99 — 2-digit padding, id100..id999 — 3-digit.
++    Сохраняет совместимость с существующими id07/id99 и расширяет до id999.
++    Stage 1 / A4: max_routers=999."""
++    return f"id{num:02d}" if num < 100 else f"id{num:03d}"
++
++
+ def discover(cfg: dict) -> list[Router]:
+     """Возвращает список роутеров, онлайн-подключённых через FRPS."""
+     web_lo, web_hi = cfg["web_port_range"]
+@@ -73,8 +81,13 @@ def discover(cfg: dict) -> list[Router]:
+     seen_ids: set[str] = set()
+ 
+     for p in sorted(ssh_ports):
+-        num = p % 100
+-        rid = f"id{num:02d}"
++        # num: 1..999, port - ssh_lo + 1.
++        # Для ssh_lo=11001: port 11007 → num=7 → id07 (как раньше),
++        # port 11100 → num=100 → id100 (раньше был баг id00 из-за p%100).
++        num = p - ssh_lo + 1
++        if num < 1 or num > 999:
++            continue
++        rid = _format_router_id(num)
+         if rid in seen_ids:
+             continue
+         seen_ids.add(rid)
+@@ -160,21 +173,40 @@ class SSH:
+ # Actions (что можно сделать с роутером)
+ # =============================================================================
+ 
++#  Stage 1 / Пункт 1+3+A5: один комбинированный probe вместо нескольких
++#  раундтрипов. Старая `/etc/init.d/podkop running` всегда возвращает
++#  not-running т.к. подкоп не procd-демон — заменено на детектор по
++#  процессу sing-box + nftables-таблице PodkopTable.
++#  Дополнительно: LOCAL_IP (yandex.ru/internet идёт мимо VLESS),
++#  EGRESS_JSON (ifconfig.co идёт через VLESS), MODEL/OPENWRT/PODKOPVER/
++#  SINGBOXVER для админского info-экрана.
+ POLL_SCRIPT = r"""
+ echo "---UPTIME---"
+ cat /proc/uptime 2>/dev/null | awk '{print int($1)}' || echo 0
+-echo "---PODKOP---"
+-if [ -x /etc/init.d/podkop ]; then
+-  /etc/init.d/podkop running >/dev/null 2>&1 && echo RUN || echo STOP
+-elif command -v service >/dev/null 2>&1; then
+-  service podkop status >/dev/null 2>&1 && echo RUN || echo STOP
+-else
+-  echo UNKNOWN
+-fi
++echo "---SING---"
++pgrep -f "^/usr/bin/sing-box" >/dev/null 2>&1 && echo 1 || echo 0
++echo "---TABLE---"
++nft list tables 2>/dev/null | grep -q "PodkopTable" && echo 1 || echo 0
++echo "---LOCAL---"
++wget -qT5 -O- 'https://yandex.ru/internet/api/v0/ip/' 2>/dev/null | tr -d '"' | tr -d '\n'
++echo ""
++echo "---EGRESS---"
++wget -qT5 -O- 'https://ifconfig.co/json' 2>/dev/null
++echo ""
+ echo "---WAN---"
+ ( ifstatus wan 2>/dev/null | awk -F'"' '/\"address\"/ {print $4; exit}' ) || echo ""
+ echo "---VLESS---"
+ uci -q get podkop.main.proxy_string || echo ""
++echo "---MODEL---"
++( cat /tmp/sysinfo/model 2>/dev/null ) \
++ || ( ubus call system board 2>/dev/null | jsonfilter -e '@.model' 2>/dev/null ) \
++ || echo ""
++echo "---OPENWRT---"
++( . /etc/openwrt_release 2>/dev/null && echo "$DISTRIB_RELEASE" ) || echo ""
++echo "---PODKOPVER---"
++opkg list-installed 2>/dev/null | awk '/^podkop /{print $3; exit}' || echo ""
++echo "---SINGBOXVER---"
++/usr/bin/sing-box version 2>/dev/null | awk '/sing-box version/{print $3; exit}' || echo ""
+ echo "---END---"
+ """
+ 
+@@ -193,23 +225,71 @@ def _format_uptime(seconds: int) -> str:
+ 
+ 
+ def _section(out: str, name: str) -> str:
+-    """Достаёт кусок между ---NAME--- и следующим ---X--- маркером."""
+-    m = re.search(rf"---{name}---\n(.*?)(?=---[A-Z]+---|\Z)", out, re.DOTALL)
++    """Достаёт кусок между ---NAME--- и следующим ---X--- маркером.
++    Stage 1: расширили допустимые символы маркера на [A-Z_] чтобы поддержать
++    PODKOPVER / SINGBOXVER (хотя сейчас уехали на бессуффиксные имена)."""
++    m = re.search(rf"---{name}---\n?(.*?)(?=---[A-Z_]+---|\Z)", out, re.DOTALL)
+     return m.group(1).strip() if m else ""
+ 
+ 
++def _parse_egress_json(raw: str) -> dict:
++    """ifconfig.co/json иногда добавляет посторонние строки (echo "" после
++    wget). Достаём первый {...}-блок."""
++    if not raw:
++        return {}
++    m = re.search(r"\{.*\}", raw, re.DOTALL)
++    if not m:
++        return {}
++    try:
++        return json.loads(m.group(0))
++    except (json.JSONDecodeError, ValueError):
++        return {}
++
++
++def _compute_podkop_status(sing: bool, table: bool, local_ip: str, egress_ip: str) -> str:
++    """Stage 1: новый детектор статуса.
++    - STOP: процесс sing-box не запущен или нет nftables-таблицы PodkopTable.
++    - RUN: процесс есть, таблица есть, и трафик реально уходит через VLESS
++      (egress_ip != local_ip).
++    - BYPASS: процесс есть, но egress совпадает с local — трафик идёт мимо
++      VLESS (например, маршруты слетели). Жёлтый предупреждающий статус.
++    - RUN (без верификации): процесс есть, но один из IP-проб упал —
++      даём benefit of the doubt.
++    """
++    if not sing or not table:
++        return "STOP"
++    if local_ip and egress_ip:
++        return "RUN" if local_ip != egress_ip else "BYPASS"
++    return "RUN"
++
++
+ @dataclass
+ class PollResult:
+     online: bool = False
+     uptime: str = "—"
+-    podkop: str = "UNKNOWN"
++    podkop: str = "UNKNOWN"   # legacy: RUN/STOP/BYPASS/UNKNOWN — для status_icon
+     wan_ip: str = ""
+     vless: str = ""
+     error: str = ""
++    # Stage 1 additions:
++    sing_running: bool = False
++    nft_table: bool = False
++    local_ip: str = ""              # IP от провайдера (yandex)
++    egress_ip: str = ""             # IP на выходе из VLESS (ifconfig.co)
++    egress_country: str = ""        # full name e.g. "Germany"
++    egress_country_iso: str = ""    # 2-letter ISO e.g. "DE"
++    egress_city: str = ""
++    egress_asn_org: str = ""
++    podkop_via_vless: bool = False  # local_ip != egress_ip
++    hw_model: str = ""
++    openwrt_version: str = ""
++    podkop_version: str = ""
++    singbox_version: str = ""
+ 
+ 
+ def poll_router(r: Router, ssh_cfg: dict) -> PollResult:
+-    """Один роутер — быстрый опрос по SSH."""
++    """Один роутер — быстрый опрос по SSH.
++    Stage 1: один POLL_SCRIPT собирает все сигналы за один SSH-раундтрип."""
+     try:
+         with SSH(
+             host=ssh_cfg.get("host", "127.0.0.1"),
+@@ -218,14 +298,49 @@ def poll_router(r: Router, ssh_cfg: dict) -> PollResult:
+             password=ssh_cfg["password"],
+             timeout=ssh_cfg.get("connect_timeout", 8),
+         ) as s:
+-            _, out, _ = s.run(POLL_SCRIPT, timeout=12)
+-        upsec = int((_section(out, "UPTIME") or "0").splitlines()[0] or 0)
++            # Таймаут увеличен с 12 до 20 — два внешних wget'а могут занять
++            # 5+5 секунд в худшем случае.
++            _, out, _ = s.run(POLL_SCRIPT, timeout=20)
++
++        # uptime
++        upsec_str = (_section(out, "UPTIME") or "0").splitlines()[0].strip() or "0"
++        try:
++            upsec = int(upsec_str)
++        except ValueError:
++            upsec = 0
++
++        # podkop signals
++        sing = (_section(out, "SING") or "0").strip() == "1"
++        table = (_section(out, "TABLE") or "0").strip() == "1"
++        local_ip = (_section(out, "LOCAL") or "").strip()
++        egress = _parse_egress_json(_section(out, "EGRESS"))
++        egress_ip = (egress.get("ip") or "").strip()
++        egress_country = (egress.get("country") or "").strip()
++        egress_country_iso = (egress.get("country_iso") or "").strip()
++        egress_city = (egress.get("city") or "").strip()
++        egress_asn_org = (egress.get("asn_org") or "").strip()
++        podkop_via_vless = bool(local_ip and egress_ip and local_ip != egress_ip)
++        podkop_status = _compute_podkop_status(sing, table, local_ip, egress_ip)
++
+         return PollResult(
+             online=True,
+             uptime=_format_uptime(upsec),
+-            podkop=_section(out, "PODKOP") or "UNKNOWN",
++            podkop=podkop_status,
+             wan_ip=_section(out, "WAN") or "",
+             vless=_section(out, "VLESS") or "",
++            sing_running=sing,
++            nft_table=table,
++            local_ip=local_ip,
++            egress_ip=egress_ip,
++            egress_country=egress_country,
++            egress_country_iso=egress_country_iso,
++            egress_city=egress_city,
++            egress_asn_org=egress_asn_org,
++            podkop_via_vless=podkop_via_vless,
++            hw_model=(_section(out, "MODEL") or "").strip(),
++            openwrt_version=(_section(out, "OPENWRT") or "").strip(),
++            podkop_version=(_section(out, "PODKOPVER") or "").strip(),
++            singbox_version=(_section(out, "SINGBOXVER") or "").strip(),
+         )
+     except SSHError as e:
+         return PollResult(online=False, error=str(e))

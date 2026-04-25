@@ -1,0 +1,1568 @@
+diff -urN a/bot/db.py b/bot/db.py
+--- a/bot/db.py	2026-04-24 14:36:47.817000099 +0300
++++ b/bot/db.py	2026-04-24 14:36:47.810000099 +0300
+@@ -104,7 +104,14 @@
+     hw_model            TEXT,      -- 'Xiaomi Redmi AC2100'
+     openwrt_version     TEXT,
+     podkop_version      TEXT,
+-    singbox_version     TEXT
++    singbox_version     TEXT,
++    -- Stage 2 / A1+A2+пункт 7:
++    lifecycle_status    TEXT,      -- NULL/'online'/'offline'/'transit'/'maintenance'
++    custom_vless_url    TEXT,      -- если задан, роутер выходит из ротации
++    in_pool             INTEGER,   -- 0/1; 0 ⇒ в ротации не участвует
++    wifi_ssid           TEXT,      -- последний снапшот SSID (для отображения)
++    wifi_encryption     TEXT,      -- последний снапшот шифрования
++    wifi_updated_at     TEXT       -- когда снапшот сделан
+ );
+ 
+ CREATE TABLE IF NOT EXISTS router_state_history (
+@@ -170,6 +177,7 @@
+         cur = self._conn.execute("PRAGMA table_info(router_state)")
+         existing = {row[1] for row in cur.fetchall()}
+         new_cols = [
++            # Stage 1
+             ("sing_running",       "INTEGER"),
+             ("nft_table",          "INTEGER"),
+             ("local_ip",           "TEXT"),
+@@ -182,6 +190,13 @@
+             ("openwrt_version",    "TEXT"),
+             ("podkop_version",     "TEXT"),
+             ("singbox_version",    "TEXT"),
++            # Stage 2 (A1, A2, клиентский пункт 7)
++            ("lifecycle_status",   "TEXT"),
++            ("custom_vless_url",   "TEXT"),
++            ("in_pool",            "INTEGER"),
++            ("wifi_ssid",          "TEXT"),
++            ("wifi_encryption",    "TEXT"),
++            ("wifi_updated_at",    "TEXT"),
+         ]
+         for name, decl in new_cols:
+             if name not in existing:
+@@ -241,6 +256,18 @@
+     def get_client(self, tg_id: int) -> Optional[sqlite3.Row]:
+         return self.q1("SELECT * FROM clients WHERE tg_id=?", (tg_id,))
+ 
++    def client_by_username(self, username: str) -> Optional[sqlite3.Row]:
++        """Stage 2 / A9: поиск клиента по telegram @username (без учёта регистра)."""
++        if not username:
++            return None
++        u = username.strip().lstrip("@")
++        if not u:
++            return None
++        return self.q1(
++            "SELECT * FROM clients WHERE LOWER(username)=LOWER(?) LIMIT 1",
++            (u,),
++        )
++
+     def all_clients(self) -> list[sqlite3.Row]:
+         return self.q("SELECT * FROM clients ORDER BY role DESC, created_at")
+ 
+@@ -507,6 +534,49 @@
+         self.ex("DELETE FROM router_state WHERE router_id=?", (router_id,))
+         self.ex("DELETE FROM router_vless_allow WHERE router_id=?", (router_id,))
+ 
++    # --- Stage 2: lifecycle / custom VLESS / WiFi snapshot helpers ---
++    # Все три апдейта используют UPSERT, чтобы запись router_state создавалась
++    # автоматически даже если poll ещё не успел её сделать (например, после
++    # ручного добавления роутера в конфиг).
++
++    def set_lifecycle(self, router_id: str, status: str | None) -> None:
++        """status ∈ {'online','offline','transit','maintenance', None}.
++        None = «как у polling» (использовать online/offline по результатам опроса).
++        Кнопки админа выставляют 'transit' и 'maintenance'; «✅ Активировать» и
++        «▶ Снять техработы» сбрасывают в None."""
++        self.ex(
++            """INSERT INTO router_state(router_id, lifecycle_status)
++               VALUES (?, ?)
++               ON CONFLICT(router_id) DO UPDATE SET lifecycle_status=excluded.lifecycle_status""",
++            (router_id, status),
++        )
++
++    def set_custom_vless(self, router_id: str, url: str | None) -> None:
++        """url=None ⇒ кастом сброшен, in_pool=1 (роутер возвращается в ротацию).
++        url=str ⇒ in_pool=0, кастом активен."""
++        in_pool = 1 if url is None else 0
++        self.ex(
++            """INSERT INTO router_state(router_id, custom_vless_url, in_pool)
++               VALUES (?, ?, ?)
++               ON CONFLICT(router_id) DO UPDATE SET
++                 custom_vless_url=excluded.custom_vless_url,
++                 in_pool=excluded.in_pool""",
++            (router_id, url, in_pool),
++        )
++
++    def set_wifi_snapshot(self, router_id: str, ssid: str | None,
++                          encryption: str | None) -> None:
++        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
++        self.ex(
++            """INSERT INTO router_state(router_id, wifi_ssid, wifi_encryption, wifi_updated_at)
++               VALUES (?, ?, ?, ?)
++               ON CONFLICT(router_id) DO UPDATE SET
++                 wifi_ssid=excluded.wifi_ssid,
++                 wifi_encryption=excluded.wifi_encryption,
++                 wifi_updated_at=excluded.wifi_updated_at""",
++            (router_id, ssid, encryption, now),
++        )
++
+     # --- audit ---
+     def audit(
+         self,
+diff -urN a/bot/r_bot.py b/bot/r_bot.py
+--- a/bot/r_bot.py	2026-04-24 14:36:47.818000099 +0300
++++ b/bot/r_bot.py	2026-04-24 14:36:47.812000099 +0300
+@@ -18,6 +18,7 @@
+ import datetime as dt
+ import gzip
+ import io
++import json
+ import logging
+ import os
+ import re
+@@ -56,6 +57,7 @@
+     cfg_edit_label,
+     discover,
+     do_get_vless,
++    do_get_wifi,
+     do_global_check,
+     do_info,
+     do_logread,
+@@ -64,9 +66,12 @@
+     do_podkop_restart,
+     do_reboot,
+     do_set_vless,
++    do_set_wifi,
++    mask_vless_for_audit,
+     parse_vless,
+     poll_all,
+     poll_router,
++    validate_custom_vless,
+ )
+ 
+ 
+@@ -189,7 +194,14 @@
+     return InlineKeyboardButton(label, callback_data=data)
+ 
+ 
+-def status_icon(online: bool, podkop: str | None) -> str:
++def status_icon(online: bool, podkop: str | None, lifecycle: str | None = None) -> str:
++    # Stage 2 / A1: lifecycle перекрывает обычный статус.
++    #   transit       — 🟣 (едет к клиенту, не опрашивается)
++    #   maintenance   — 🛠 (техработы, не опрашивается)
++    if lifecycle == "transit":
++        return "🟣"
++    if lifecycle == "maintenance":
++        return "🛠"
+     if not online:
+         return "🔴"
+     if podkop == "RUN":
+@@ -203,6 +215,18 @@
+     return "⚪"
+ 
+ 
++def _row_lifecycle(st) -> str | None:
++    """Безопасно достаёт lifecycle_status из sqlite3.Row — на старых записях
++    колонки может не быть в Row, либо значение NULL."""
++    if st is None:
++        return None
++    try:
++        v = st["lifecycle_status"]
++    except (IndexError, KeyError):
++        return None
++    return v or None
++
++
+ def _country_flag(iso: str) -> str:
+     """ISO 3166 alpha-2 ('DE') → 🇩🇪 (regional indicator pair). Возвращает
+     пустую строку, если код некорректный или пустой. Не делает доп.
+@@ -290,13 +314,19 @@
+ 
+ 
+ def kb_main_client(db: DB, tg_id: int) -> InlineKeyboardMarkup:
++    # Stage 2 / A1: роутеры в transit клиент не видит — они ещё не активированы
++    # и физически могут ехать к нему. Maintenance показываем с плашкой 🛠.
+     rids = db.client_routers(tg_id)
+     rows = []
+     for rid in rids:
+         st = db.get_state(rid)
++        lifecycle = _row_lifecycle(st)
++        if lifecycle == "transit":
++            continue
+         icon = status_icon(
+             bool(st and st["online"]),
+             st["podkop_status"] if st else None,
++            lifecycle,
+         )
+         label = (st["label"] if st and st["label"] else rid)
+         rows.append([btn(f"{icon} {rid} — {label}", f"r:{rid}")])
+@@ -313,20 +343,53 @@
+     )
+ 
+ 
+-def kb_router_menu(rid: str, role: str) -> InlineKeyboardMarkup:
++def kb_router_menu(rid: str, role: str, st=None) -> InlineKeyboardMarkup:
+     # Stage 1 / Пункты 5, 6: переименованы кнопки.
+     #   "🔧 Restart podkop"  → "🔄 Перезагрузить службу"
+     #   "🔁 Reboot"          → "♻️ Перезагрузить Роутер (рекомендуется)"
+-    # Кнопка ребута роутера теперь занимает отдельную строку (длинный текст).
++    # Stage 2 / Пункт 7: добавлена кнопка "📶 WiFi" (всем).
++    # Stage 2 / A1, A2, A9: админские кнопки lifecycle / custom VLESS / владельцы.
++    is_admin_user = (role == "admin")
++    lifecycle = _row_lifecycle(st)
++    custom_vless = ""
++    if st is not None:
++        try:
++            custom_vless = st["custom_vless_url"] or ""
++        except (IndexError, KeyError):
++            custom_vless = ""
++
++    # Stage 2 / A1: для роутеров в техработах клиент не должен видеть кнопок
++    # действий — только статус и сообщение. См. _show_router (обработка
++    # maintenance возвращает плашку без меню).
+     rows = [
+         [btn("🔄 Статус", f"r:{rid}"), btn("▶️ Проверить", f"act:{rid}:check")],
+         [btn("🔄 Перезагрузить службу", f"act:{rid}:pres")],
+         [btn("♻️ Перезагрузить Роутер (рекомендуется)", f"act:{rid}:boot")],
+         [btn("🔗 Сменить VLESS", f"vless:pick:{rid}:0")],
++        [btn("📶 WiFi", f"wifi:menu:{rid}")],
+     ]
+-    if role == "admin":
++    if is_admin_user:
+         rows.append([btn("📜 Logs", f"act:{rid}:logs"), btn("📜 Podkop logs", f"act:{rid}:plogs")])
+         rows.append([btn("ℹ️ Info", f"act:{rid}:info")])
++        # A2: custom VLESS / возврат в пул — взаимоисключающие.
++        if custom_vless:
++            rows.append([btn("🔁 Вернуть в пул", f"vless:pool:{rid}")])
++        else:
++            rows.append([btn("🔧 Custom VLESS", f"vless:custom:{rid}")])
++        # A1: lifecycle-кнопки. Состояние-зависимое.
++        if lifecycle == "transit":
++            rows.append([btn("✅ Активировать", f"act:{rid}:activate")])
++        elif lifecycle == "maintenance":
++            rows.append([btn("▶ Снять техработы", f"act:{rid}:maintenance_off")])
++        else:
++            rows.append([
++                btn("🛠 Техработы", f"act:{rid}:maintenance"),
++                btn("🚚 В пути", f"act:{rid}:in_transit"),
++            ])
++        # A9: владельцы.
++        rows.append([
++            btn("👥 Владельцы", f"own:list:{rid}"),
++        ])
+         rows.append(
+             [
+                 btn("✏️ Переименовать", f"label:ren:{rid}"),
+@@ -441,7 +504,11 @@
+ # Список роутеров (admin)
+ # =============================================================================
+ 
+-PAGE_SIZE = 10
++# Stage 2 / A3: 3 кнопки в ряд → 10 рядов на страницу = 30 роутеров.
++# Влезает в один экран мобильника, не нужно листать в типичном случае
++# (50 устройств = 2 страницы).
++PAGE_SIZE = 30
++LIST_COLS = 3
+ 
+ 
+ async def cb_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+@@ -451,25 +518,83 @@
+     await _show_list(update, ctx, mode, page)
+ 
+ 
++def _owner_short_map(db: DB, rids: list[str]) -> dict[str, str]:
++    """Собирает {rid → 'owner4'} для подписи на компактной кнопке.
++    Берётся первый по сортировке по tg_id (стабильно). Если владельцев нет —
++    пустая строка."""
++    if not rids:
++        return {}
++    placeholders = ",".join("?" * len(rids))
++    rows = db.q(
++        f"""SELECT b.router_id, c.username, c.first_name
++            FROM bindings b
++            LEFT JOIN clients c ON c.tg_id = b.tg_id
++            WHERE b.router_id IN ({placeholders})
++            ORDER BY b.router_id, b.tg_id""",
++        tuple(rids),
++    )
++    out: dict[str, str] = {}
++    for r in rows:
++        rid = r["router_id"]
++        if rid in out:
++            continue   # уже взяли первого
++        name = (r["username"] or r["first_name"] or "").strip()
++        if name:
++            out[rid] = name[:4]
++    return out
++
++
+ async def _show_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE, mode: str, page: int):
+     db: DB = ctx.application.bot_data["db"]
+     all_ids = all_router_ids(ctx)
+     states = {s["router_id"]: s for s in db.all_states()}
+ 
+-    def matches(rid: str) -> bool:
++    def lifecycle_of(rid: str) -> str | None:
+         s = states.get(rid)
+-        online = bool(s and s["online"])
+-        podkop = s["podkop_status"] if s else None
++        if not s:
++            return None
++        try:
++            return s["lifecycle_status"] or None
++        except (IndexError, KeyError):
++            return None
++
++    def effective_status(rid: str) -> str:
++        """Возвращает один из: 'online'/'offline'/'transit'/'maintenance'.
++        Lifecycle перекрывает poll-статус."""
++        ls = lifecycle_of(rid)
++        if ls in ("transit", "maintenance"):
++            return ls
++        s = states.get(rid)
++        return "online" if (s and s["online"]) else "offline"
++
++    # Stage 2 / A1: пять режимов фильтра — online/offline/transit/maintenance/all.
++    # «bad» оставляем для обратной совместимости (старые callback ссылки).
++    def matches(rid: str) -> bool:
++        es = effective_status(rid)
+         if mode == "all":
+             return True
+-        if mode == "bad":
+-            return (not online) or (podkop == "STOP")
+         if mode == "online":
+-            return online
++            return es == "online"
+         if mode == "offline":
+-            return not online
++            return es == "offline"
++        if mode == "transit":
++            return es == "transit"
++        if mode == "maint":
++            return es == "maintenance"
++        if mode == "bad":   # legacy
++            s = states.get(rid)
++            online = es == "online"
++            podkop = s["podkop_status"] if s else None
++            return (not online) or (podkop == "STOP")
+         return True
+ 
++    # Подсчёт по всем категориям сразу — для счётчиков на чипах.
++    counts = {"online": 0, "offline": 0, "transit": 0, "maintenance": 0}
++    for rid in all_ids:
++        es = effective_status(rid)
++        if es in counts:
++            counts[es] += 1
++
+     filtered = [r for r in all_ids if matches(r)]
+     total = len(filtered)
+     start = page * PAGE_SIZE
+@@ -477,16 +602,26 @@
+ 
+     rcfg: dict = ctx.application.bot_data["r_config"]
+     overrides = rcfg.get("overrides") or {}
++    owner_map = _owner_short_map(db, chunk)
+ 
+-    rows = []
++    rows: list = []
++    cur_row: list = []
+     for rid in chunk:
+         s = states.get(rid)
+         online = bool(s and s["online"])
+         podkop = s["podkop_status"] if s else None
+-        icon = status_icon(online, podkop)
+-        label = overrides.get(rid) or (s["label"] if s and s["label"] else "")
+-        short = f"{icon} {rid}" + (f" — {label[:24]}" if label else "")
+-        rows.append([btn(short, f"r:{rid}")])
++        ls = lifecycle_of(rid)
++        icon = status_icon(online, podkop, ls)
++        owner4 = owner_map.get(rid, "")
++        # Компактная подпись: «🟢 id07 yari». Override label не вмещаем —
++        # увидит на экране роутера. owner4 важнее для парк-менеджмента.
++        short = f"{icon} {rid}" + (f" {owner4}" if owner4 else "")
++        cur_row.append(btn(short, f"r:{rid}"))
++        if len(cur_row) >= LIST_COLS:
++            rows.append(cur_row)
++            cur_row = []
++    if cur_row:
++        rows.append(cur_row)
+ 
+     nav = []
+     if page > 0:
+@@ -496,23 +631,46 @@
+     if nav:
+         rows.append(nav)
+ 
+-    mode_row = [
+-        btn("Все" + (" •" if mode == "all" else ""), "list:all:0"),
+-        btn("Проблемные" + (" •" if mode == "bad" else ""), "list:bad:0"),
+-        btn("Online" + (" •" if mode == "online" else ""), "list:online:0"),
+-        btn("Offline" + (" •" if mode == "offline" else ""), "list:offline:0"),
+-    ]
+-    rows.append(mode_row)
++    # Stage 2 / A1: фильтры lifecycle с числовыми счётчиками. Активный — точкой.
++    def chip(label: str, m: str, n: int | None = None) -> object:
++        cnt = "" if n is None else f" ({n})"
++        suf = " •" if mode == m else ""
++        return btn(f"{label}{cnt}{suf}", f"list:{m}:0")
++
++    rows.append([
++        chip("🟢", "online", counts["online"]),
++        chip("🔴", "offline", counts["offline"]),
++        chip("🟣", "transit", counts["transit"]),
++        chip("🛠", "maint", counts["maintenance"]),
++    ])
++    rows.append([
++        chip("📋 все", "all", len(all_ids)),
++        # Заглушка для будущего поиска (оставляем чтобы кнопка появилась
++        # сразу — реализация в Stage 3 / отдельной правке).
++        btn("🔍 Поиск (скоро)", "list:search_stub"),
++    ])
+     rows.append([btn("← Главная", "menu:main")])
+ 
++    title_map = {
++        "all": "все", "online": "🟢 online", "offline": "🔴 offline",
++        "transit": "🟣 transit", "maint": "🛠 maintenance", "bad": "проблемные",
++    }
+     text = (
+-        f"<b>Роутеры ({mode})</b>\n"
++        f"<b>Роутеры — {title_map.get(mode, mode)}</b>\n"
+         f"Показано {len(chunk)} из {total}\n"
+         f"Страница {page+1}/{max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)}"
+     )
+     await reply_or_edit(update, text, kb(rows))
+ 
+ 
++async def cb_list_search_stub(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
++    """Заглушка для кнопки 'Поиск (скоро)' — отвечаем alert'ом, не уходим
++    с экрана. Stage 3 заменит на реальный поиск по id/owner."""
++    q = update.callback_query
++    if q:
++        await q.answer("Поиск появится в Stage 3", show_alert=False)
++
++
+ # =============================================================================
+ # Меню одного роутера
+ # =============================================================================
+@@ -537,11 +695,36 @@
+     overrides = rcfg.get("overrides") or {}
+     label = overrides.get(rid) or (st["label"] if st and st["label"] else "(без имени)")
+     role = user_role(ctx, u.id)
++    is_admin_user = (role == "admin")
++
++    # Stage 2 / A1: lifecycle. Клиент с transit-роутером сюда не должен попадать
++    # (фильтр в client_routers_visible), но если попал по прямой ссылке —
++    # отказываем. На maintenance клиенту показываем серую плашку без кнопок.
++    lifecycle = _row_lifecycle(st)
++    if lifecycle == "transit" and not is_admin_user:
++        await reply_or_edit(
++            update,
++            "Этот роутер пока не активирован администратором.",
++            kb([[btn("← Главная", "menu:main")]]),
++        )
++        return
++    if lifecycle == "maintenance" and not is_admin_user:
++        await reply_or_edit(
++            update,
++            f"<b>{rid}</b> — {esc(label)}\n\n🛠 Техработы, попробуйте позже.",
++            kb([[btn("🔄 Обновить статус", f"r:{rid}"), btn("← Главная", "menu:main")]]),
++        )
++        return
+ 
+     if st:
+-        is_admin = (role == "admin")
+-        icon = status_icon(bool(st["online"]), st["podkop_status"])
+-        status = "online" if st["online"] else "offline"
++        is_admin = is_admin_user
++        icon = status_icon(bool(st["online"]), st["podkop_status"], lifecycle)
++        if lifecycle == "transit":
++            status = "🟣 transit (едет к клиенту)"
++        elif lifecycle == "maintenance":
++            status = "🛠 maintenance (техработы)"
++        else:
++            status = "online" if st["online"] else "offline"
+         podkop = st["podkop_status"] or "—"
+         up = st["uptime"] or "—"
+         wan = st["wan_ip"] or ""
+@@ -595,6 +778,18 @@
+                 short = _short_vless(active_vless)
+                 if short:
+                     lines.append(f"VLESS: <code>{esc(short)}</code>")
++        # Stage 2 / A2: для админа — индикатор кастомного VLESS / выхода из пула.
++        if is_admin:
++            custom_vless = _g("custom_vless_url")
++            in_pool_raw = None
++            try:
++                in_pool_raw = st["in_pool"]
++            except (IndexError, KeyError):
++                in_pool_raw = None
++            if custom_vless:
++                lines.append("🔧 <b>custom VLESS</b> (роутер вне пула ротации)")
++            elif in_pool_raw == 0:
++                lines.append("⚠ роутер вне пула (in_pool=0)")
+         # Пункт 1 (часть admin): версионный блок только для админа.
+         if is_admin:
+             ver_bits = []
+@@ -616,7 +811,7 @@
+             "пока не опрошен. Нажми «Обновить статус» или подожди polling."
+         )
+ 
+-    await reply_or_edit(update, text, kb_router_menu(rid, role))
++    await reply_or_edit(update, text, kb_router_menu(rid, role, st))
+ 
+ 
+ # =============================================================================
+@@ -633,8 +828,17 @@
+     "info": ("Info", "показать info", None),
+     "logs": ("Logread", "показать logread", None),
+     "plogs": ("Podkop logs", "показать podkop logs", None),
++    # Stage 2 / A1: lifecycle (только админ — проверка ниже).
++    "maintenance":     ("Техработы",        "перевести роутер в режим техработ", None),
++    "maintenance_off": ("Снять техработы",   "снять режим техработ",              None),
++    "in_transit":      ("В пути",            "пометить роутер как «в пути»",      None),
++    "activate":        ("Активировать",       "активировать роутер",                None),
+ }
+ 
++# Stage 2 / A1: множества действий для удобной классификации.
++LIFECYCLE_ACTIONS = {"maintenance", "maintenance_off", "in_transit", "activate"}
++READONLY_ACTIONS = {"info", "logs", "plogs", "check"}
++
+ 
+ async def cb_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+     q = update.callback_query
+@@ -648,8 +852,22 @@
+ 
+     label_act, human, rl_key = ACTION_LABELS.get(act, (act, act, None))
+ 
++    # Stage 2 / A1: lifecycle-действия — только админ.
++    if act in LIFECYCLE_ACTIONS:
++        if not is_admin(ctx, u.id):
++            await reply_or_edit(update, "Только админ.", kb([[btn("← назад", f"r:{rid}")]]))
++            return
++        # Подтверждение всё равно показываем — это «состояние парка», не
++        # хочется случайным тычком увести роутер в transit.
++        text = (
++            f"<b>{rid}</b>\n\n"
++            f"Точно {human}? Изменение lifecycle-статуса будет записано в audit-лог."
++        )
++        await reply_or_edit(update, text, kb_confirm(f"do:{rid}:{act}", f"r:{rid}"))
++        return
++
+     # действия read-only — без подтверждения
+-    if act in ("info", "logs", "plogs", "check"):
++    if act in READONLY_ACTIONS:
+         await _execute_action(update, ctx, rid, act, first=True)
+         return
+ 
+@@ -680,6 +898,38 @@
+     rcfg: dict = ctx.application.bot_data["r_config"]
+     log = ctx.application.bot_data["log"]
+ 
++    # Stage 2 / A1: lifecycle-операции — не нужен SSH, не нужен полл, не нужен
++    # rate-limit. Просто пишем статус в БД и audit. Делаем это ДО offline-guard,
++    # т.к. transit/maintenance чаще всего ставится именно когда роутер не онлайн.
++    if act in LIFECYCLE_ACTIONS:
++        if not is_admin(ctx, u.id):
++            await reply_or_edit(update, "Только админ.", kb([[btn("← назад", f"r:{rid}")]]))
++            return
++        new_status = {
++            "maintenance":     "maintenance",
++            "maintenance_off": None,    # снятие — обнуляем lifecycle
++            "in_transit":      "transit",
++            "activate":        None,    # активация — тоже обнуляем (станет online по поллу)
++        }.get(act)
++        try:
++            db.set_lifecycle(rid, new_status)
++            db.audit(u.id, u.username, rid, f"lifecycle:{act}",
++                     f"new={new_status!s}", "ok")
++            log.info("lifecycle %s %s by %s -> %s", act, rid, u.id, new_status)
++        except Exception as e:
++            log.exception("lifecycle %s on %s failed", act, rid)
++            db.audit(u.id, u.username, rid, f"lifecycle:{act}", None, f"fail: {e}")
++            await reply_or_edit(
++                update,
++                f"❌ Ошибка: <code>{esc(str(e))}</code>",
++                kb([[btn("← назад", f"r:{rid}")]]),
++            )
++            return
++        # Перерисовываем карточку роутера — кнопки теперь будут другими
++        # (например, после maintenance появится «▶ Снять техработы»).
++        await _show_router(update, ctx, rid)
++        return
++
+     # rate limit (не для admin)
+     role = user_role(ctx, u.id)
+     rl_key = ACTION_LABELS.get(act, (None, None, None))[2]
+@@ -953,6 +1203,24 @@
+     rcfg: dict = ctx.application.bot_data["r_config"]
+     log = ctx.application.bot_data["log"]
+ 
++    # Stage 2 / A2: если на роутере выставлен custom VLESS — он вне пула,
++    # ротация запрещена. Админ должен сначала «🔁 Вернуть в пул», и только
++    # потом сможет менять через стандартный flow.
++    st = db.get_state(rid)
++    if st is not None:
++        try:
++            cv = st["custom_vless_url"]
++        except (IndexError, KeyError):
++            cv = None
++        if cv:
++            await reply_or_edit(
++                update,
++                f"<b>{rid}</b> на custom VLESS — ротация из пула заблокирована.\n\n"
++                "Чтобы вернуться к стандартному пулу, нажми «🔁 Вернуть в пул» в меню роутера.",
++                kb([[btn("← назад", f"r:{rid}")]]),
++            )
++            return
++
+     # rate limit
+     role = user_role(ctx, u.id)
+     if role != "admin":
+@@ -1004,6 +1272,459 @@
+ 
+ 
+ # =============================================================================
++# Stage 2 / A2: Custom VLESS — ввод вручную, выход из пула, возврат в пул
++# =============================================================================
++# Поток:
++#   1. Админ жмёт «🔧 Custom VLESS»  (cb_vless_custom_start)
++#   2. Бот переводит user_data в state="awaiting_custom_vless" с rid в state_rid
++#   3. Текстовый handler парсит/валидирует, кладёт url+rid в user_data
++#      и показывает двойное подтверждение (cb_vless_custom_confirm)
++#   4. На «✅ Применить» — SSH set + db.set_custom_vless + audit
++#   5. Возврат в пул: «🔁 Вернуть в пул» (cb_vless_pool_return) — двойное
++#      подтверждение, db.set_custom_vless(rid, None), in_pool=1.
++#      На роутер ничего не пишем — следующий пик из пула применит ключ.
++
++async def cb_vless_custom_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
++    q = update.callback_query
++    _, _, rid = q.data.split(":")
++    u = update.effective_user
++    if not u or not is_admin(ctx, u.id):
++        await reply_or_edit(update, "Только админ.", kb([[btn("← назад", f"r:{rid}")]]))
++        return
++    ctx.user_data["state"] = "awaiting_custom_vless"
++    ctx.user_data["state_rid"] = rid
++    await reply_or_edit(
++        update,
++        f"<b>{rid}</b> — Custom VLESS\n\n"
++        "Пришли строку <code>vless://...</code> с reality-параметрами "
++        "(security=reality, pbk=..., sni=...).\n\n"
++        "После применения роутер выйдет из пула ротации.\n"
++        "Чтобы отменить — /cancel или нажми ниже.",
++        kb([[btn("← Отмена", f"r:{rid}")]]),
++    )
++
++
++async def cb_vless_custom_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
++    """Применить custom VLESS — пользователь нажал «✅ Применить»."""
++    q = update.callback_query
++    _, _, rid = q.data.split(":")
++    u = update.effective_user
++    if not u or not is_admin(ctx, u.id):
++        await q.answer("Только админ", show_alert=True)
++        return
++    url = ctx.user_data.pop("pending_custom_vless_url", None)
++    expected_rid = ctx.user_data.pop("pending_custom_vless_rid", None)
++    if not url or expected_rid != rid:
++        await reply_or_edit(
++            update,
++            "Сессия истекла. Начни заново.",
++            kb([[btn("← назад", f"r:{rid}")]]),
++        )
++        return
++
++    db: DB = ctx.application.bot_data["db"]
++    rcfg: dict = ctx.application.bot_data["r_config"]
++    log = ctx.application.bot_data["log"]
++
++    r = router_by_id(ctx, rid)
++    if r is None:
++        db.audit(u.id, u.username, rid, "vless_custom_apply",
++                 mask_vless_for_audit(url), "fail: offline")
++        await reply_or_edit(
++            update,
++            f"{rid} offline — применение невозможно. Custom URL не сохранён.",
++            kb([[btn("← назад", f"r:{rid}")]]),
++        )
++        return
++
++    await reply_or_edit(update, f"Применяю custom VLESS на {rid}…")
++    loop = asyncio.get_event_loop()
++    ok, msg = await loop.run_in_executor(None, do_set_vless, r, rcfg["ssh"], url, True)
++    masked = mask_vless_for_audit(url)
++    if ok:
++        db.set_custom_vless(rid, url)
++        db.audit(u.id, u.username, rid, "vless_custom_apply", masked, "ok")
++        log.info("custom vless on %s by %s -> ok", rid, u.id)
++        text = (
++            f"<b>{rid}</b> ✅\n\nCustom VLESS применён, роутер выведен из пула.\n"
++            f"Маска для audit: <code>{esc(masked)}</code>"
++        )
++    else:
++        db.audit(u.id, u.username, rid, "vless_custom_apply", masked, f"fail: {msg}")
++        text = (
++            f"<b>{rid}</b> ❌\n\nНе удалось применить custom VLESS:\n"
++            f"<pre>{esc(msg[:500])}</pre>\n\nИзменения не сохранены."
++        )
++    await reply_or_edit(
++        update,
++        text,
++        kb([
++            [btn("▶️ Проверить", f"act:{rid}:check")],
++            [btn("← назад", f"r:{rid}")],
++        ]),
++    )
++
++
++async def cb_vless_pool_return(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
++    """Вернуть роутер в пул — снять custom_vless_url, in_pool=1.
++    На роутер ничего не пишем; админ потом сам выберет новый ключ из пула
++    через стандартный «🔗 Сменить VLESS»."""
++    q = update.callback_query
++    _, _, rid = q.data.split(":")
++    u = update.effective_user
++    if not u or not is_admin(ctx, u.id):
++        await reply_or_edit(update, "Только админ.", kb([[btn("← назад", f"r:{rid}")]]))
++        return
++    db: DB = ctx.application.bot_data["db"]
++    log = ctx.application.bot_data["log"]
++    db.set_custom_vless(rid, None)
++    db.audit(u.id, u.username, rid, "vless_custom_clear", None, "ok")
++    log.info("custom vless cleared on %s by %s", rid, u.id)
++    await reply_or_edit(
++        update,
++        f"<b>{rid}</b> ✅\n\nCustom VLESS снят, роутер вернулся в пул ротации.\n"
++        "На самом роутере текущий URL остался прежним — выбери новый из пула, "
++        "если нужно сменить.",
++        kb([
++            [btn("🔗 Сменить VLESS", f"vless:pick:{rid}:0")],
++            [btn("← назад", f"r:{rid}")],
++        ]),
++    )
++
++
++# =============================================================================
++# Stage 2 / клиентский пункт 7 + админ: WiFi-меню
++# =============================================================================
++# Поток:
++#   1. cb_wifi_menu — читает по SSH (или из снапшота если оффлайн), показывает
++#      SSID и маскированный пароль; для админа кнопка «👁 Показать пароль».
++#   2. cb_wifi_edit_start — переводит state="awaiting_wifi_ssid", rid
++#   3. text handler ssid → state="awaiting_wifi_pwd"
++#   4. text handler pwd → cb_wifi_edit_confirm с двойным подтверждением
++#   5. cb_wifi_edit_apply — do_set_wifi + audit (без пароля) + лимит 5/день клиенту
++
++async def cb_wifi_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
++    q = update.callback_query
++    _, _, rid = q.data.split(":")
++    u = update.effective_user
++    if not u or not client_owns_router(ctx, u.id, rid):
++        await reply_or_edit(update, "Нет доступа.", kb([[btn("← Главная", "menu:main")]]))
++        return
++
++    db: DB = ctx.application.bot_data["db"]
++    rcfg: dict = ctx.application.bot_data["r_config"]
++    role = user_role(ctx, u.id)
++    is_admin_user = (role == "admin")
++
++    # Stage 2 / A1: на maintenance/transit клиент не должен править WiFi.
++    st = db.get_state(rid)
++    lifecycle = _row_lifecycle(st)
++    if lifecycle in ("transit", "maintenance") and not is_admin_user:
++        await reply_or_edit(
++            update,
++            f"<b>{rid}</b>\n\n🛠 Сейчас идут техработы, WiFi-настройки недоступны.",
++            kb([[btn("← назад", f"r:{rid}")]]),
++        )
++        return
++
++    # Пробуем прочитать актуальные настройки. Если оффлайн — берём snapshot.
++    r = router_by_id(ctx, rid)
++    info_ssid = ""
++    info_enc = ""
++    info_key = ""
++    note = ""
++    source = "live"
++    if r is not None:
++        await reply_or_edit(update, f"<b>{rid}</b> — читаю WiFi-настройки…")
++        loop = asyncio.get_event_loop()
++        try:
++            wi = await loop.run_in_executor(None, do_get_wifi, r, rcfg["ssh"])
++            if wi.error:
++                source = "snapshot"
++                note = f"⚠ ошибка чтения: {wi.error[:80]}"
++            else:
++                info_ssid = wi.ssid
++                info_enc = wi.encryption
++                info_key = wi.key
++                note = wi.note
++                # Освежим снапшот в БД.
++                db.set_wifi_snapshot(rid, info_ssid or None, info_enc or None)
++        except Exception as e:
++            source = "snapshot"
++            note = f"⚠ исключение: {e}"
++    else:
++        source = "snapshot"
++        note = "роутер offline, показываю последний снапшот"
++    if source == "snapshot":
++        try:
++            info_ssid = (st["wifi_ssid"] if st else "") or ""
++            info_enc = (st["wifi_encryption"] if st else "") or ""
++        except (IndexError, KeyError):
++            pass
++
++    masked = ("•" * min(len(info_key), 12)) if info_key else "(скрыто)"
++    enc_display = info_enc or "WPA2-PSK"
++    lines = [
++        f"📶 <b>WiFi настройки {rid}</b>",
++        "━━━━━━━━━━━━━━━━━━━━",
++        f"Сеть: <b>{esc(info_ssid) if info_ssid else '(не задано)'}</b>",
++    ]
++    if is_admin_user and info_key:
++        lines.append(f"Пароль: <code>{esc(masked)}</code>")
++    else:
++        lines.append(f"Пароль: <code>{masked}</code>")
++    lines.append(f"Шифрование: {esc(enc_display)}")
++    if note:
++        lines.append(f"\n<i>{esc(note)}</i>")
++    if source == "snapshot":
++        lines.append("<i>(показан снапшот, роутер недоступен — изменение запрещено)</i>")
++
++    rows: list = []
++    if is_admin_user and info_key and source == "live":
++        rows.append([btn("👁 Показать пароль (admin)", f"wifi:show:{rid}")])
++    if source == "live":
++        rows.append([btn("✏️ Изменить", f"wifi:edit:{rid}")])
++    rows.append([btn("← назад", f"r:{rid}")])
++    await reply_or_edit(update, "\n".join(lines), kb(rows))
++
++
++async def cb_wifi_show_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
++    """Только админ: показать пароль явно (с предупреждением, audit)."""
++    q = update.callback_query
++    _, _, rid = q.data.split(":")
++    u = update.effective_user
++    if not u or not is_admin(ctx, u.id):
++        await q.answer("Только админ", show_alert=True)
++        return
++    db: DB = ctx.application.bot_data["db"]
++    rcfg: dict = ctx.application.bot_data["r_config"]
++    r = router_by_id(ctx, rid)
++    if r is None:
++        await reply_or_edit(update, f"{rid} offline.", kb([[btn("← назад", f"wifi:menu:{rid}")]]))
++        return
++    await reply_or_edit(update, "Читаю пароль…")
++    loop = asyncio.get_event_loop()
++    wi = await loop.run_in_executor(None, do_get_wifi, r, rcfg["ssh"])
++    if wi.error:
++        await reply_or_edit(
++            update, f"❌ {esc(wi.error)}",
++            kb([[btn("← назад", f"wifi:menu:{rid}")]]),
++        )
++        return
++    db.audit(u.id, u.username, rid, "wifi_password_view", None, "ok")
++    text = (
++        f"📶 <b>{rid}</b> — пароль (admin view)\n"
++        f"SSID: <code>{esc(wi.ssid)}</code>\n"
++        f"Пароль: <code>{esc(wi.key)}</code>\n\n"
++        "<i>Этот просмотр записан в audit-лог.</i>"
++    )
++    await reply_or_edit(
++        update, text,
++        kb([[btn("← назад", f"wifi:menu:{rid}")]]),
++    )
++
++
++async def cb_wifi_edit_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
++    q = update.callback_query
++    _, _, rid = q.data.split(":")
++    u = update.effective_user
++    if not u or not client_owns_router(ctx, u.id, rid):
++        await q.answer("Нет доступа", show_alert=True)
++        return
++    ctx.user_data["state"] = "awaiting_wifi_ssid"
++    ctx.user_data["state_rid"] = rid
++    await reply_or_edit(
++        update,
++        f"📶 <b>{rid}</b> — изменить WiFi\n\n"
++        "Шаг 1/2: пришли новое имя сети (SSID), 1–32 символа.\n\n"
++        "/cancel чтобы отменить.",
++        kb([[btn("← Отмена", f"wifi:menu:{rid}")]]),
++    )
++
++
++async def cb_wifi_edit_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
++    """Применить WiFi — пользователь нажал «✅ Применить»."""
++    q = update.callback_query
++    _, _, rid = q.data.split(":")
++    u = update.effective_user
++    if not u or not client_owns_router(ctx, u.id, rid):
++        await q.answer("Нет доступа", show_alert=True)
++        return
++    new_ssid = ctx.user_data.pop("pending_wifi_ssid", None)
++    new_pwd = ctx.user_data.pop("pending_wifi_pwd", None)
++    expected_rid = ctx.user_data.pop("pending_wifi_rid", None)
++    if not new_ssid or not new_pwd or expected_rid != rid:
++        await reply_or_edit(
++            update, "Сессия истекла. Начни заново.",
++            kb([[btn("← назад", f"wifi:menu:{rid}")]]),
++        )
++        return
++    db: DB = ctx.application.bot_data["db"]
++    cfg: dict = ctx.application.bot_data["cfg"]
++    rcfg: dict = ctx.application.bot_data["r_config"]
++    log = ctx.application.bot_data["log"]
++    role = user_role(ctx, u.id)
++
++    # Лимит для клиента: 5 в сутки. Админу — без лимита.
++    if role != "admin":
++        limit = cfg["rate_limits"].get("wifi_change_per_day", 5)
++        if limit > 0 and not db.rate_check_and_inc(u.id, "wifi_change", limit):
++            await reply_or_edit(
++                update,
++                f"Лимит смен WiFi на сегодня исчерпан ({limit}/день). Попробуй завтра.",
++                kb([[btn("← назад", f"wifi:menu:{rid}")]]),
++            )
++            return
++
++    r = router_by_id(ctx, rid)
++    if r is None:
++        db.audit(u.id, u.username, rid, "wifi_change", None, "fail: offline")
++        await reply_or_edit(
++            update, f"{rid} offline — изменение невозможно.",
++            kb([[btn("← назад", f"wifi:menu:{rid}")]]),
++        )
++        return
++
++    # Прочитаем старый ssid для audit (пароль НЕ пишем).
++    old_ssid = ""
++    try:
++        cur = db.get_state(rid)
++        old_ssid = (cur["wifi_ssid"] if cur else "") or ""
++    except (IndexError, KeyError):
++        old_ssid = ""
++
++    await reply_or_edit(update, f"Применяю WiFi на {rid}…")
++    loop = asyncio.get_event_loop()
++    ok, msg = await loop.run_in_executor(
++        None, do_set_wifi, r, rcfg["ssh"], new_ssid, new_pwd
++    )
++    args_audit = json.dumps({"ssid_before": old_ssid, "ssid_after": new_ssid},
++                            ensure_ascii=False)
++    if ok:
++        db.set_wifi_snapshot(rid, new_ssid, "psk2")
++        db.audit(u.id, u.username, rid, "wifi_change", args_audit, "ok")
++        log.info("wifi change %s by %s -> ok (ssid=%s)", rid, u.id, new_ssid)
++        text = (
++            f"<b>{rid}</b> ✅\n\nWiFi обновлён. Все устройства должны переподключиться "
++            f"с новым паролем.\n\nНовая сеть: <b>{esc(new_ssid)}</b>"
++        )
++    else:
++        db.audit(u.id, u.username, rid, "wifi_change", args_audit, f"fail: {msg}")
++        text = f"<b>{rid}</b> ❌\n\n<pre>{esc(msg[:500])}</pre>"
++    await reply_or_edit(
++        update, text,
++        kb([
++            [btn("📶 К WiFi-меню", f"wifi:menu:{rid}")],
++            [btn("← назад", f"r:{rid}")],
++        ]),
++    )
++
++
++# =============================================================================
++# Stage 2 / A9: admin owners management UI
++# =============================================================================
++# Модель: связка клиент↔роутер хранится в таблице bindings (N:N).
++# Админ может добавить (@username или tg_id) и снять владельца.
++# Кнопка «👥 Владельцы» в меню роутера → cb_owners_list.
++
++async def cb_owners_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
++    q = update.callback_query
++    _, _, rid = q.data.split(":")
++    u = update.effective_user
++    if not u or not is_admin(ctx, u.id):
++        await q.answer("Только админ", show_alert=True)
++        return
++    db: DB = ctx.application.bot_data["db"]
++    owners = db.router_clients(rid)
++    lines = [f"👥 <b>{rid}</b> — владельцы"]
++    if not owners:
++        lines.append("\n<i>(нет привязанных клиентов)</i>")
++    else:
++        lines.append("")
++        for c in owners:
++            try:
++                uname = c["username"] or ""
++                fname = c["first_name"] or ""
++                tgid = c["tg_id"]
++                role = c["role"] or "client"
++            except (IndexError, KeyError):
++                continue
++            who = f"@{esc(uname)}" if uname else esc(fname or str(tgid))
++            tag = "👑" if role == "admin" else "👤"
++            lines.append(f"{tag} {who} · <code>{tgid}</code>")
++    rows: list = [[btn("➕ Добавить владельца", f"own:add:{rid}")]]
++    for c in owners:
++        try:
++            uname = c["username"] or ""
++            fname = c["first_name"] or ""
++            tgid = c["tg_id"]
++        except (IndexError, KeyError):
++            continue
++        short = f"@{uname}" if uname else (fname or str(tgid))
++        if len(short) > 20:
++            short = short[:19] + "…"
++        rows.append([btn(f"✖ {short}", f"own:rm:{rid}:{tgid}")])
++    rows.append([btn("← к роутеру", f"r:{rid}")])
++    await reply_or_edit(update, "\n".join(lines), kb(rows))
++
++
++async def cb_owner_add_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
++    q = update.callback_query
++    _, _, rid = q.data.split(":")
++    u = update.effective_user
++    if not u or not is_admin(ctx, u.id):
++        await q.answer("Только админ", show_alert=True)
++        return
++    ctx.user_data["state"] = "awaiting_owner_add"
++    ctx.user_data["state_rid"] = rid
++    await reply_or_edit(
++        update,
++        f"👥 <b>{rid}</b> — добавить владельца\n\n"
++        "Пришли <code>@username</code> или числовой <code>tg_id</code>.\n\n"
++        "⚠ Клиент должен уже существовать в БД (нажимал /start). "
++        "Если его нет — попроси запустить бота, потом вернись сюда.\n\n"
++        "/cancel чтобы отменить.",
++        kb([[btn("← Отмена", f"own:list:{rid}")]]),
++    )
++
++
++async def cb_owner_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
++    q = update.callback_query
++    parts = q.data.split(":")
++    # own:rm:<rid>:<tg_id>
++    if len(parts) != 4:
++        await q.answer("bad callback", show_alert=True)
++        return
++    _, _, rid, tgid_s = parts
++    try:
++        tgid = int(tgid_s)
++    except ValueError:
++        await q.answer("bad tg_id", show_alert=True)
++        return
++    u = update.effective_user
++    if not u or not is_admin(ctx, u.id):
++        await q.answer("Только админ", show_alert=True)
++        return
++    db: DB = ctx.application.bot_data["db"]
++    cli = db.get_client(tgid)
++    try:
++        uname = (cli["username"] if cli else "") or ""
++    except (IndexError, KeyError):
++        uname = ""
++    try:
++        db.unbind(tgid, rid)
++        db.audit(u.id, u.username, rid, "owner_remove",
++                 f"tg_id={tgid} @{uname or '—'}", "ok")
++        await cb_owners_list(update, ctx)
++    except Exception as e:
++        log = ctx.application.bot_data.get("log")
++        if log:
++            log.exception("owner_remove")
++        await reply_or_edit(update, f"❌ {esc(e)}",
++                            kb([[btn("← назад", f"own:list:{rid}")]]))
++
++
++# =============================================================================
+ # Admin: VLESS пул
+ # =============================================================================
+ 
+@@ -1792,6 +2513,195 @@
+             await msg.reply_text(f"❌ {esc(e)}")
+         return
+ 
++    # --- Stage 2 / A2: custom VLESS (admin) ---
++    if state == "awaiting_custom_vless":
++        if not is_admin(ctx, u.id):
++            ctx.user_data.pop("state", None)
++            ctx.user_data.pop("state_rid", None)
++            return
++        rid = ctx.user_data.get("state_rid")
++        ctx.user_data.pop("state", None)
++        ctx.user_data.pop("state_rid", None)
++        if not rid:
++            return
++        ok, info, parsed = validate_custom_vless(text)
++        if not ok:
++            await msg.reply_text(
++                f"❌ Невалидный VLESS: {esc(info)}\n\n"
++                "Нужны: <code>vless://UUID@host:port?security=reality&pbk=...&sni=...</code>\n\n"
++                "Попробуй ещё раз через «🔧 Custom VLESS» или /cancel.",
++                parse_mode=ParseMode.HTML,
++            )
++            return
++        ctx.user_data["pending_custom_vless_url"] = text.strip()
++        ctx.user_data["pending_custom_vless_rid"] = rid
++        masked = mask_vless_for_audit(text)
++        warn = (
++            f"<b>{rid}</b> — подтверди custom VLESS\n\n"
++            f"Краткая форма: <code>{esc(info)}</code>\n"
++            f"Маска для audit: <code>{esc(masked)}</code>\n\n"
++            "⚠ После применения роутер выйдет из ротации пула.\n"
++            "Чтобы вернуть — нажми «🔁 Вернуть в пул»."
++        )
++        await msg.reply_text(
++            warn,
++            parse_mode=ParseMode.HTML,
++            reply_markup=kb([
++                [btn("✅ Применить", f"vless:capply:{rid}")],
++                [btn("✖ Отмена", f"r:{rid}")],
++            ]),
++        )
++        return
++
++    # --- Stage 2 / клиентский пункт 7: WiFi SSID ---
++    if state == "awaiting_wifi_ssid":
++        rid = ctx.user_data.get("state_rid")
++        if not rid:
++            ctx.user_data.pop("state", None)
++            return
++        # Проверяем доступ
++        if not client_owns_router(ctx, u.id, rid):
++            ctx.user_data.pop("state", None)
++            ctx.user_data.pop("state_rid", None)
++            return
++        ssid = text.strip()
++        # SSID: 1..32 байта (utf-8). Контроль-символы запрещены.
++        if not ssid or len(ssid.encode("utf-8")) > 32:
++            await msg.reply_text(
++                "❌ SSID должен быть 1–32 байта (UTF-8). Пришли ещё раз или /cancel."
++            )
++            return
++        if any(ord(c) < 32 for c in ssid):
++            await msg.reply_text(
++                "❌ В SSID нельзя использовать управляющие символы. Пришли ещё раз или /cancel."
++            )
++            return
++        ctx.user_data["pending_wifi_ssid"] = ssid
++        ctx.user_data["state"] = "awaiting_wifi_pwd"
++        await msg.reply_text(
++            f"📶 <b>{rid}</b>\nSSID принят: <code>{esc(ssid)}</code>\n\n"
++            "Шаг 2/2: пришли новый пароль (8–63 символа ASCII).\n\n"
++            "/cancel чтобы отменить.",
++            parse_mode=ParseMode.HTML,
++            reply_markup=kb([[btn("✖ Отмена", f"wifi:menu:{rid}")]]),
++        )
++        return
++
++    # --- Stage 2 / клиентский пункт 7: WiFi password ---
++    if state == "awaiting_wifi_pwd":
++        rid = ctx.user_data.get("state_rid")
++        if not rid:
++            ctx.user_data.pop("state", None)
++            ctx.user_data.pop("pending_wifi_ssid", None)
++            return
++        if not client_owns_router(ctx, u.id, rid):
++            ctx.user_data.pop("state", None)
++            ctx.user_data.pop("state_rid", None)
++            ctx.user_data.pop("pending_wifi_ssid", None)
++            return
++        pwd = text.strip()
++        # WPA2-PSK требует 8..63 печатных ASCII.
++        if len(pwd) < 8 or len(pwd) > 63:
++            await msg.reply_text(
++                "❌ Пароль 8–63 символа. Пришли ещё раз или /cancel."
++            )
++            return
++        try:
++            pwd.encode("ascii")
++        except UnicodeEncodeError:
++            await msg.reply_text(
++                "❌ Только ASCII (буквы/цифры/знаки). Пришли ещё раз или /cancel."
++            )
++            return
++        if any(ord(c) < 32 or ord(c) == 127 for c in pwd):
++            await msg.reply_text(
++                "❌ Управляющие символы запрещены. Пришли ещё раз или /cancel."
++            )
++            return
++        ssid = ctx.user_data.get("pending_wifi_ssid", "")
++        ctx.user_data["pending_wifi_pwd"] = pwd
++        ctx.user_data["pending_wifi_rid"] = rid
++        ctx.user_data.pop("state", None)
++        ctx.user_data.pop("state_rid", None)
++        masked = "•" * min(len(pwd), 12)
++        warn = (
++            f"📶 <b>{rid}</b> — подтверди новые WiFi-настройки\n"
++            "━━━━━━━━━━━━━━━━━━━━\n"
++            f"SSID: <b>{esc(ssid)}</b>\n"
++            f"Пароль: <code>{masked}</code> (длина {len(pwd)})\n\n"
++            "⚠ После применения <b>все</b> устройства отключатся и должны "
++            "переподключиться с новым паролем (включая телефон, с которого "
++            "ты пишешь, если он на этом WiFi).\n\n"
++            "Применить?"
++        )
++        await msg.reply_text(
++            warn,
++            parse_mode=ParseMode.HTML,
++            reply_markup=kb([
++                [btn("✅ Применить", f"wifi:wapply:{rid}")],
++                [btn("✖ Отмена", f"wifi:menu:{rid}")],
++            ]),
++        )
++        return
++
++    # --- Stage 2 / A9: добавить владельца ---
++    if state == "awaiting_owner_add":
++        if not is_admin(ctx, u.id):
++            ctx.user_data.pop("state", None)
++            ctx.user_data.pop("state_rid", None)
++            return
++        rid = ctx.user_data.get("state_rid")
++        ctx.user_data.pop("state", None)
++        ctx.user_data.pop("state_rid", None)
++        if not rid:
++            return
++        # Принимаем @username или числовой tg_id.
++        target = text.strip().lstrip("@")
++        tg_id: int | None = None
++        username: str | None = None
++        if target.isdigit():
++            tg_id = int(target)
++            row = db.get_client(tg_id)
++            if row:
++                try:
++                    username = row["username"]
++                except (IndexError, KeyError):
++                    username = None
++        else:
++            username = target
++            row = db.client_by_username(username)
++            if row:
++                try:
++                    tg_id = row["tg_id"]
++                except (IndexError, KeyError):
++                    tg_id = None
++        if tg_id is None:
++            await msg.reply_text(
++                f"❌ Клиента <code>{esc(target)}</code> нет в базе.\n\n"
++                "Сначала клиент должен сам нажать /start у бота — после этого "
++                "появится в /clients и его можно привязать.\n\n"
++                f"Возврат: /start или нажми ниже.",
++                parse_mode=ParseMode.HTML,
++                reply_markup=kb([[btn("← к роутеру", f"r:{rid}")]]),
++            )
++            return
++        try:
++            db.bind(tg_id, rid)
++            db.audit(u.id, u.username, rid, "owner_add",
++                     f"tg_id={tg_id} @{username or '—'}", "ok")
++            await msg.reply_text(
++                f"✅ <code>@{esc(username or str(tg_id))}</code> привязан к <b>{rid}</b>.",
++                parse_mode=ParseMode.HTML,
++                reply_markup=kb([
++                    [btn("👥 К списку владельцев", f"own:list:{rid}")],
++                    [btn("← к роутеру", f"r:{rid}")],
++                ]),
++            )
++        except Exception as e:
++            log.exception("owner_add")
++            await msg.reply_text(f"❌ {esc(e)}")
++        return
++
+     # --- по умолчанию ---
+     await cmd_start(update, ctx)
+ 
+@@ -1815,16 +2725,33 @@
+         log.error("load r_config: %s", e)
+         return
+     routers = discover(rcfg)
++    # Stage 2 / A1: для роутеров в transit/maintenance не идём по SSH —
++    # они либо в пути (физически не подключены), либо на техработах
++    # (преднамеренное «не трогать»). Иначе будут тонны false-positive
++    # offline-уведомлений и забитый thread-пул.
++    skip_lifecycle = set()
++    for st in db.all_states():
++        try:
++            ls = st["lifecycle_status"]
++        except (IndexError, KeyError):
++            ls = None
++        if ls in ("transit", "maintenance"):
++            skip_lifecycle.add(st["router_id"])
++    pollable_routers = [r for r in routers if r.id not in skip_lifecycle]
+     results = poll_all(
+-        routers,
++        pollable_routers,
+         rcfg["ssh"],
+         workers=cfg["poll"]["parallel_workers"],
+     )
+     overrides = rcfg.get("overrides") or {}
+     # Отметить знакомые offline роутеры
+     known = set(all_slots_from_config(rcfg)) | {r.id for r in routers}
+-    online_ids = {r.id for r in routers}
++    online_ids = {r.id for r in pollable_routers}
+     for rid in sorted(known):
++        # Stage 2 / A1: lifecycle-роутеры обновляем только меткой, поллинг не
++        # трогает их online-флаг (был = остаётся; админ управляет вручную).
++        if rid in skip_lifecycle:
++            continue
+         label = overrides.get(rid, "") or ""
+         if rid in online_ids:
+             res = results.get(rid)
+@@ -2031,7 +2958,11 @@
+             await _do_poll(ctx.application)
+             await cmd_start(update, ctx)
+             return
+-        # list:all:0 / list:bad:1 ...
++        # list:all:0 / list:bad:1 ... (Stage 2: + transit, maint)
++        # Stage 2 / A1: заглушка для будущей кнопки поиска (без page-suffix).
++        if data == "list:search_stub":
++            await cb_list_search_stub(update, ctx)
++            return
+         if data.startswith("list:"):
+             await cb_list(update, ctx)
+             return
+@@ -2056,6 +2987,39 @@
+         if data.startswith("vless:apply:"):
+             await cb_vless_apply(update, ctx)
+             return
++        # Stage 2 / A2: custom VLESS
++        if data.startswith("vless:custom:"):
++            await cb_vless_custom_start(update, ctx)
++            return
++        if data.startswith("vless:capply:"):
++            await cb_vless_custom_confirm(update, ctx)
++            return
++        if data.startswith("vless:pool:"):
++            await cb_vless_pool_return(update, ctx)
++            return
++        # Stage 2 / клиент пкт 7: WiFi menu + edit
++        if data.startswith("wifi:menu:"):
++            await cb_wifi_menu(update, ctx)
++            return
++        if data.startswith("wifi:show:"):
++            await cb_wifi_show_password(update, ctx)
++            return
++        if data.startswith("wifi:edit:"):
++            await cb_wifi_edit_start(update, ctx)
++            return
++        if data.startswith("wifi:wapply:"):
++            await cb_wifi_edit_confirm(update, ctx)
++            return
++        # Stage 2 / A9: owners management
++        if data.startswith("own:list:"):
++            await cb_owners_list(update, ctx)
++            return
++        if data.startswith("own:add:"):
++            await cb_owner_add_start(update, ctx)
++            return
++        if data.startswith("own:rm:"):
++            await cb_owner_remove(update, ctx)
++            return
+         if data == "pool:list":
+             await cb_pool_list(update, ctx)
+             return
+diff -urN a/bot/router.py b/bot/router.py
+--- a/bot/router.py	2026-04-24 14:36:47.821000099 +0300
++++ b/bot/router.py	2026-04-24 14:36:47.814000099 +0300
+@@ -567,6 +567,200 @@
+ 
+ 
+ # =============================================================================
++# Stage 2 / A2: строгая валидация custom VLESS
++# =============================================================================
++
++# Минимальный набор обязательных query-параметров для reality-VLESS:
++#   security=reality, pbk=<...>, sni=<...>
++# fp/sid/type — опциональны, не валидируем.
++
++_VLESS_RE = re.compile(
++    r"^vless://([0-9a-fA-F-]{32,40})@([A-Za-z0-9.\-]+):(\d{1,5})\?(.+?)(#.*)?$"
++)
++
++
++def validate_custom_vless(url: str) -> tuple[bool, str, dict]:
++    """Возвращает (ok, error_or_short, parsed_fields).
++    parsed_fields: {id, host, port, security, pbk, sni}.
++    short = укороченный вид для подтверждения, например
++    'vless://…@de.example.com:443/...'."""
++    if not url or not isinstance(url, str):
++        return False, "пустой URL", {}
++    url = url.strip()
++    if not url.startswith("vless://"):
++        return False, "должен начинаться с vless://", {}
++    m = _VLESS_RE.match(url)
++    if not m:
++        return False, "не удалось распарсить vless URL", {}
++    uuid, host, port_s, query, _frag = m.groups()
++    try:
++        port = int(port_s)
++    except ValueError:
++        return False, "порт не число", {}
++    if not (1 <= port <= 65535):
++        return False, "порт вне диапазона 1..65535", {}
++    # Парсим query вручную (urlparse не дружит с vless)
++    params: dict[str, str] = {}
++    for kv in query.split("&"):
++        if "=" not in kv:
++            continue
++        k, v = kv.split("=", 1)
++        params[k.strip()] = v.strip()
++    if params.get("security", "").lower() != "reality":
++        return False, "поддерживается только security=reality", {}
++    if not params.get("pbk"):
++        return False, "отсутствует pbk", {}
++    if not params.get("sni"):
++        return False, "отсутствует sni", {}
++    short = f"vless://…@{host}:{port}/?security=reality&sni={params['sni']}"
++    return True, short, {
++        "id": uuid,
++        "host": host,
++        "port": port,
++        "security": "reality",
++        "pbk": params["pbk"],
++        "sni": params["sni"],
++    }
++
++
++def mask_vless_for_audit(url: str) -> str:
++    """Маскирует чувствительные поля для записи в audit:
++    UUID и pbk — оставляем последние 4 символа, остальное → ***."""
++    def _mask(s: str) -> str:
++        if not s or len(s) <= 4:
++            return "***"
++        return "***" + s[-4:]
++    try:
++        m = _VLESS_RE.match(url.strip())
++        if not m:
++            return "vless://(invalid)"
++        uuid, host, port_s, query, _frag = m.groups()
++        new_q_parts = []
++        for kv in query.split("&"):
++            if "=" not in kv:
++                new_q_parts.append(kv)
++                continue
++            k, v = kv.split("=", 1)
++            if k == "pbk":
++                new_q_parts.append(f"pbk={_mask(v)}")
++            else:
++                new_q_parts.append(kv)
++        return f"vless://{_mask(uuid)}@{host}:{port_s}?{'&'.join(new_q_parts)}"
++    except Exception:
++        return "vless://(masked)"
++
++
++# =============================================================================
++# Stage 2 / клиентский пункт 7: WiFi read / apply
++# =============================================================================
++
++# Скрипт для чтения текущих SSID/encryption на обоих радио (2.4 + 5).
++# Парсим вывод uci через простой grep — busybox awk бывает капризный.
++WIFI_READ_SCRIPT = r"""
++echo "===SSID0==="
++uci -q get wireless.@wifi-iface[0].ssid
++echo "===KEY0==="
++uci -q get wireless.@wifi-iface[0].key
++echo "===ENC0==="
++uci -q get wireless.@wifi-iface[0].encryption
++echo "===SSID1==="
++uci -q get wireless.@wifi-iface[1].ssid
++echo "===KEY1==="
++uci -q get wireless.@wifi-iface[1].key
++echo "===ENC1==="
++uci -q get wireless.@wifi-iface[1].encryption
++echo "===END==="
++"""
++
++
++@dataclass
++class WifiInfo:
++    ssid: str = ""
++    key: str = ""
++    encryption: str = ""
++    # Если 2.4 и 5 ГГц расходятся (наследие до объединения) — фиксируем.
++    consistent: bool = True
++    note: str = ""
++    error: str = ""
++
++
++def _wifi_section(out: str, name: str) -> str:
++    pat = re.compile(rf"===\s*{re.escape(name)}\s*===\n([\s\S]*?)(?=\n===|\Z)")
++    m = pat.search(out)
++    if not m:
++        return ""
++    return m.group(1).strip()
++
++
++def do_get_wifi(r: Router, ssh_cfg: dict) -> WifiInfo:
++    """Читает текущие WiFi-настройки. Если 2.4 и 5 ГГц настроены по-разному —
++    возвращает значения от iface[0] и note='radios out of sync'."""
++    try:
++        with SSH(
++            ssh_cfg.get("host", "127.0.0.1"),
++            r.ssh_port,
++            ssh_cfg.get("user", "root"),
++            ssh_cfg["password"],
++            ssh_cfg.get("connect_timeout", 8),
++        ) as s:
++            _, out, _ = s.run(WIFI_READ_SCRIPT, timeout=15)
++    except SSHError as e:
++        return WifiInfo(error=str(e))
++    s0 = _wifi_section(out, "SSID0")
++    s1 = _wifi_section(out, "SSID1")
++    k0 = _wifi_section(out, "KEY0")
++    k1 = _wifi_section(out, "KEY1")
++    e0 = _wifi_section(out, "ENC0")
++    e1 = _wifi_section(out, "ENC1")
++    consistent = (s0 == s1) and (k0 == k1) and (e0 == e1)
++    note = "" if consistent else "2.4 и 5 ГГц настроены по-разному, бот применит общий профиль на оба радио"
++    return WifiInfo(
++        ssid=s0,
++        key=k0,
++        encryption=e0,
++        consistent=consistent,
++        note=note,
++    )
++
++
++def do_set_wifi(r: Router, ssh_cfg: dict, ssid: str, password: str) -> tuple[bool, str]:
++    """Применяет общие SSID/password на wifi-iface[0] и [1] с шифрованием psk2.
++    После uci commit — `wifi reload` (НЕ перезагружает роутер, только радио)."""
++    if not (1 <= len(ssid.encode("utf-8")) <= 32):
++        return False, "SSID должен быть 1-32 байта"
++    if not (8 <= len(password) <= 63):
++        return False, "пароль должен быть 8-63 символа"
++    if not all(32 <= ord(c) < 127 for c in password):
++        return False, "пароль должен содержать только печатные ASCII"
++    ssid_q = shlex.quote(ssid)
++    pwd_q = shlex.quote(password)
++    script = f"""
++uci set wireless.@wifi-iface[0].ssid={ssid_q}
++uci set wireless.@wifi-iface[0].key={pwd_q}
++uci set wireless.@wifi-iface[0].encryption='psk2'
++uci set wireless.@wifi-iface[1].ssid={ssid_q} 2>/dev/null || true
++uci set wireless.@wifi-iface[1].key={pwd_q} 2>/dev/null || true
++uci set wireless.@wifi-iface[1].encryption='psk2' 2>/dev/null || true
++uci commit wireless
++wifi reload 2>&1 || /sbin/wifi reload 2>&1
++echo "(wifi reload done)"
++"""
++    try:
++        with SSH(
++            ssh_cfg.get("host", "127.0.0.1"),
++            r.ssh_port,
++            ssh_cfg.get("user", "root"),
++            ssh_cfg["password"],
++            ssh_cfg.get("connect_timeout", 8),
++        ) as s:
++            rc, out, err = s.run(script, timeout=30)
++        ok = rc == 0
++        return ok, (out or err).strip() or "ok"
++    except SSHError as e:
++        return False, str(e)
++
++
++# =============================================================================
+ # YAML-редактор ярлыков (синхронизирован с r.py)
+ # =============================================================================
+ 
